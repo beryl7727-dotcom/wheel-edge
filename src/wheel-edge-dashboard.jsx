@@ -3,18 +3,18 @@ import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 're
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { checkConnectionStatus } from './services/tigerAPIClient.js';
-import { fetchTigerPositions, normaliseForReview, buildWheelEdgePosition, MOCK_TIGER_POSITIONS } from './services/tigerImportService.js';
-import {
-  syncPosition, deletePos,
-  syncCampaign, deleteCampaign,
-  syncJournal, deleteJournal,
-  syncCalEvent, deleteCalEvent,
-  syncWatchlist, deleteWatch,
-  syncSnapshot,
-  loadAllFromSupabase, seedSupabaseFromLocal,
-} from './services/supabaseSync.js';
-import { checkSupabaseConnection, isSupabaseConfigured } from './services/supabase.js';
+import { fetchTigerPositions, normaliseForReview, buildWheelEdgePosition } from './services/tigerImportService.js';
+import { db, DOMAIN_TABLE_NAMES } from './services/db.js';
+import { writeThrough, deleteThrough, registerLocalSaveListener } from './services/writeThrough.js';
+import { addExecution } from './services/executions.js';
+import { getLastCloudBackupAt } from './services/cloudBackup.js';
+import { SyncStatusIndicator, SaveToCloudButton, RestoreFromCloudButton, SnapshotHistoryList } from './components/BackupUI.jsx';
+import { RollPositionModal, PositionLineageTimeline } from './components/ExecutionLedgerUI.jsx';
+import PoemsImportWizard from './components/PoemsImportWizard.jsx';
 import * as XLSX from 'xlsx';
+
+const LOCALSTORAGE_MIGRATION_FLAG = 'migratedFromLocalStorage';
+const LEGACY_PERSIST_KEY = 'wheel-edge-store-v1';
 
 // ============================================================================
 // MOCK DATA
@@ -30,15 +30,8 @@ const ACCOUNT_SNAPSHOT = {
   marketsDate: 'US 🇺🇸',
 };
 
-const MOCK_CAMPAIGNS = [
-  { id: 'tsla-1', symbol: 'TSLA', name: 'TSLA Campaign #1', createdDate: '2026-06-01', status: 'ACTIVE', notes: '' },
-  { id: 'ibit-1', symbol: 'IBIT', name: 'IBIT Campaign #1', createdDate: '2026-06-01', status: 'ACTIVE', notes: '' },
-  { id: 'bbai-1', symbol: 'BBAI', name: 'BBAI Campaign #1', createdDate: '2026-06-01', status: 'ACTIVE', notes: '' },
-  { id: 'xlf-1',  symbol: 'XLF',  name: 'XLF Campaign #1',  createdDate: '2026-06-01', status: 'ACTIVE', notes: '' },
-];
-
 // Position category metadata
-const POSITION_CATEGORIES = {
+export const POSITION_CATEGORIES = {
   'Cash':         { icon: '💵', bg: 'bg-yellow-100', text: 'text-yellow-800', dot: 'bg-yellow-500' },
   'Short Put':    { icon: '📉', bg: 'bg-red-100',    text: 'text-red-700',    dot: 'bg-red-500' },
   'Long Shares':  { icon: '📈', bg: 'bg-blue-100',   text: 'text-blue-700',   dot: 'bg-blue-500' },
@@ -48,169 +41,9 @@ const POSITION_CATEGORIES = {
 };
 
 // Option category helpers — always use these instead of hardcoded string comparisons.
-const isOptCat  = cat => cat === 'Short Put' || cat === 'Covered Call' || cat === 'Naked Call' || cat === 'Naked Put';
-const isCallCat = cat => cat === 'Covered Call' || cat === 'Naked Call';
-const isPutCat  = cat => cat === 'Short Put'    || cat === 'Naked Put';
-
-const MOCK_POSITIONS = [
-  // ── TSLA Campaign #1 ──────────────────────────────────────────────
-  {
-    id: 1,
-    symbol: 'TSLA', category: 'Cash', status: 'OPEN',
-    campaignId: 'tsla-1', entryDate: '2026-06-01', closedData: null,
-    capitalAmount: 39000, targetPrice: 390,
-    intent: 'Reserved for TSLA put assignment at $390 strike',
-    notes: '', journalEntryIds: [],
-  },
-  {
-    id: 2,
-    symbol: 'TSLA', category: 'Short Put', status: 'OPEN',
-    campaignId: 'tsla-1', entryDate: '2026-06-17', closedData: null,
-    contracts: 1, strike: 390, expiry: 'Jul 18, 2026', dte: 31,
-    premium: 420, currentValue: 385,
-    theta: 2.45, delta: -0.35,
-    thesis: 'IV Crush play, expecting consolidation',
-    journalEntryIds: [1],
-  },
-  // ── IBIT Campaign #1 ──────────────────────────────────────────────
-  {
-    id: 3,
-    symbol: 'IBIT', category: 'Short Put', status: 'CLOSED',
-    campaignId: 'ibit-1', entryDate: '2026-05-15', closedData: {
-      closedDate: '2026-06-14', buybackCost: 0,
-      fees: 1.30, reason: 'Assignment', realizedPnL: 178.70,
-    },
-    contracts: 1, strike: 82, expiry: 'Jun 21, 2026', dte: 0,
-    premium: 180, currentValue: 0,
-    thesis: 'IBIT at support, sell put for income', journalEntryIds: [2],
-  },
-  {
-    id: 4,
-    symbol: 'IBIT', category: 'Long Shares', status: 'OPEN',
-    campaignId: 'ibit-1', entryDate: '2026-06-14', closedData: null,
-    shareCount: 100, purchasePrice: 84.50, currentSharePrice: 84.32,
-    notes: 'Assigned from Short Put at $82 strike. Cost basis $82 - $1.80 premium = $80.20.',
-    journalEntryIds: [],
-  },
-  {
-    id: 5,
-    symbol: 'IBIT', category: 'Covered Call', status: 'OPEN',
-    campaignId: 'ibit-1', entryDate: '2026-06-15', closedData: null,
-    contracts: 1, strike: 85, expiry: 'Jul 18, 2026', dte: 31,
-    premium: 180, currentValue: 175,
-    theta: 1.23, delta: 0.42,
-    thesis: 'Income generation on IBIT shares, neutral to slightly bullish',
-    journalEntryIds: [],
-  },
-  // ── BBAI Campaign #1 ──────────────────────────────────────────────
-  {
-    id: 6,
-    symbol: 'BBAI', category: 'Short Put', status: 'OPEN',
-    campaignId: 'bbai-1', entryDate: '2026-06-10', closedData: null,
-    contracts: 1, strike: 12, expiry: 'Jul 25, 2026', dte: 38,
-    premium: 85, currentValue: 72,
-    theta: 0.65, delta: -0.28,
-    thesis: 'Support at $12, accumulation zone', journalEntryIds: [3],
-  },
-  // ── XLF Campaign #1 ───────────────────────────────────────────────
-  {
-    id: 7,
-    symbol: 'XLF', category: 'Covered Call', status: 'OPEN',
-    campaignId: 'xlf-1', entryDate: '2026-06-12', closedData: null,
-    contracts: 1, strike: 38, expiry: 'Aug 15, 2026', dte: 59,
-    premium: 250, currentValue: 220,
-    theta: 1.85, delta: 0.51,
-    thesis: 'Financial sector consolidation', journalEntryIds: [],
-  },
-];
-
-const MOCK_JOURNAL = [
-  {
-    id: 1,
-    date: '2026-06-16',
-    symbol: 'TSLA',
-    positionId: 1,
-    trade: 'Sold Put 390 Strike',
-    result: '+$420 Premium',
-    tags: ['wheel', 'iv-crush', 'support'],
-    // Section 1: Trade Thesis
-    tradeThesis: {
-      reason: 'Bullish pullback to support, IV spike above 30%',
-      support: '$390',
-      target: '$420',
-      happyAssignment: true,
-    },
-    // Section 2: Simulator Recommendation (auto-populated)
-    simulatorRec: null,
-    // Section 3: My Decision
-    myDecision: {
-      action: 'Held Position',
-      reasoning: 'Waited for consolidation pattern before entering. Good reward-to-risk.',
-      decidedDate: '2026-06-16',
-    },
-    // Section 4: Actual Outcome
-    outcome: {
-      completedDate: '',
-      action: '',
-      finalProfit: null,
-      lesson: '',
-    },
-  },
-  {
-    id: 2,
-    date: '2026-06-14',
-    symbol: 'IBIT',
-    positionId: 2,
-    trade: 'Sold Covered Call 85 Strike',
-    result: '+$180 Premium, Called Away',
-    tags: ['cc', 'rollup', 'assignment'],
-    tradeThesis: {
-      reason: 'Resistance at 86, collect premium near top of range',
-      support: '$82',
-      target: '$85',
-      happyAssignment: true,
-    },
-    simulatorRec: null,
-    myDecision: {
-      action: 'Accepted Assignment',
-      reasoning: 'Stock was called away at target. Should have rolled for more premium.',
-      decidedDate: '2026-06-14',
-    },
-    outcome: {
-      completedDate: '2026-06-17',
-      action: 'Called Away at $85',
-      finalProfit: 180,
-      lesson: 'Should have rolled instead of letting it get called away. Left premium on the table.',
-    },
-  },
-  {
-    id: 3,
-    date: '2026-06-10',
-    symbol: 'BBAI',
-    positionId: 3,
-    trade: 'Sold Put 12 Strike',
-    result: '+$85 Premium, 28% profit',
-    tags: ['wheel', 'support-level', 'vega-positive'],
-    tradeThesis: {
-      reason: 'Major support level, accumulation zone, low IV environment',
-      support: '$12',
-      target: '$14',
-      happyAssignment: true,
-    },
-    simulatorRec: null,
-    myDecision: {
-      action: 'Held to Partial Close',
-      reasoning: 'Good risk/reward entry. Stock held above support.',
-      decidedDate: '2026-06-10',
-    },
-    outcome: {
-      completedDate: '',
-      action: '',
-      finalProfit: null,
-      lesson: '',
-    },
-  },
-];
+export const isOptCat  = cat => cat === 'Short Put' || cat === 'Covered Call' || cat === 'Naked Call' || cat === 'Naked Put';
+export const isCallCat = cat => cat === 'Covered Call' || cat === 'Naked Call';
+export const isPutCat  = cat => cat === 'Short Put'    || cat === 'Naked Put';
 
 const CALENDAR_CATEGORIES = [
   { id: 'earnings',   label: 'Earnings',    icon: '📊', bg: 'bg-red-100',    text: 'text-red-700',    color: '#ef4444' },
@@ -223,113 +56,6 @@ const CALENDAR_CATEGORIES = [
 
 const CAT_COLOR = (catId) => (CALENDAR_CATEGORIES.find(c => c.id === catId)?.color || '#94a3b8');
 const CAT_META  = (catId) =>  CALENDAR_CATEGORIES.find(c => c.id === catId) || { label: catId, icon: '📌', bg: 'bg-slate-100', text: 'text-slate-700', color: '#94a3b8' };
-
-const MOCK_CALENDAR = [
-  {
-    id: 1,
-    title: 'TSLA Earnings',
-    date: '2026-07-23',
-    time: 'After Market Close',
-    category: 'earnings',
-    symbol: 'TSLA',
-    iconEmoji: '📊',
-    notes: 'Q2 2026 Earnings Report',
-    description: 'Tesla Q2 2026 quarterly earnings. High IV expected — avoid selling new options 1 week before.',
-  },
-  {
-    id: 2,
-    title: 'Weekly Option Expiration',
-    date: '2026-06-19',
-    time: 'Market Close',
-    category: 'expiration',
-    iconEmoji: '⏰',
-    notes: 'Review positions for roll/close',
-    description: 'Review all expiring positions. Decide to roll, close, or let expire.',
-  },
-  {
-    id: 3,
-    title: 'IBIT Expiration',
-    date: '2026-07-18',
-    time: 'Market Close',
-    category: 'expiration',
-    symbol: 'IBIT',
-    iconEmoji: '⏰',
-    description: 'IBIT covered call expiration. Check if stock will be called away.',
-  },
-  {
-    id: 4,
-    title: 'Fed Interest Rate Decision',
-    date: '2026-07-30',
-    time: '2:00 PM ET',
-    category: 'economic',
-    iconEmoji: '🏦',
-    notes: 'Likely to impact volatility',
-    description: 'FOMC meeting outcome. Market-moving event — high IV spike expected around this date.',
-  },
-  {
-    id: 5,
-    title: 'Bitcoin Halving Anniversary',
-    date: '2026-07-15',
-    time: 'All Day',
-    category: 'crypto',
-    iconEmoji: '₿',
-    notes: 'Momentum catalyst for IBIT',
-    description: 'Watch IBIT for increased momentum. Consider selling higher-strike covered calls.',
-  },
-  {
-    id: 6,
-    title: 'Wheel Review — TSLA',
-    date: '2026-06-25',
-    time: '2:00 PM',
-    category: 'personal',
-    iconEmoji: '📝',
-    notes: 'Check if put will be assigned',
-    description: 'Weekly wheel strategy review. Assess TSLA put, plan for potential assignment and covered call.',
-  },
-];
-
-const MOCK_WATCHLIST = [
-  {
-    id: 1,
-    symbol: 'TSLA',
-    price: 241.15,
-    trend: 'Neutral',
-    support: 220,
-    resistance: 265,
-    bias: 'Neutral',
-    notes: 'Placeholder — update with current analysis',
-  },
-  {
-    id: 2,
-    symbol: 'IBIT',
-    price: 84.32,
-    trend: 'Bullish',
-    support: 82,
-    resistance: 88,
-    bias: 'Slightly Bullish',
-    notes: 'Following Bitcoin strength',
-  },
-  {
-    id: 3,
-    symbol: 'BBAI',
-    price: 12.45,
-    trend: 'Neutral',
-    support: 12,
-    resistance: 14,
-    bias: 'Neutral',
-    notes: 'Waiting for volume confirmation',
-  },
-  {
-    id: 4,
-    symbol: 'XLF',
-    price: 37.82,
-    trend: 'Bullish',
-    support: 37,
-    resistance: 39,
-    bias: 'Bullish',
-    notes: 'Rising interest rates beneficial',
-  },
-];
 
 const MOCK_SCENARIOS = [
   {
@@ -361,7 +87,7 @@ const MOCK_SCENARIOS = [
 // STATE MANAGEMENT
 // ============================================================================
 
-const useWheelStore = create(
+export const useWheelStore = create(
   persist(
     (set, get) => ({
   positions: [],
@@ -413,9 +139,14 @@ const useWheelStore = create(
     ],
   },
 
-  // Supabase connection status
+  // Supabase connection status (informational only — Supabase is a manual
+  // backup target now, this is not used to gate any automatic sync)
   supabaseStatus: { ok: false, reason: 'Not checked yet', lastChecked: null },
   setSupabaseStatus: (s) => set({ supabaseStatus: { ...s, lastChecked: new Date().toISOString() } }),
+
+  // "🟢 Local Saved" status — bumped by writeThrough/deleteThrough on every
+  // successful IndexedDB write, surfaced by SyncStatusIndicator.
+  localSyncStatus: { savedAt: null },
 
   // Data source toggle
   dataSource: 'MANUAL',
@@ -428,6 +159,15 @@ const useWheelStore = create(
   // Price snapshots for Manual Mode
   priceSnapshots: [],
 
+  // Immutable execution ledger — read-only display data, hydrated from
+  // IndexedDB on boot and refreshed after any addExecution() call. Never
+  // mutated directly via set() from anywhere else.
+  executions: [],
+  refreshExecutions: async () => {
+    const executions = await db.executions.toArray();
+    set({ executions });
+  },
+
   setDataSource: (source) => set({ dataSource: source }),
 
   updateTigerStatus: (status) => set({
@@ -435,7 +175,7 @@ const useWheelStore = create(
   }),
 
   addPriceSnapshot: (snapshot) => {
-    syncSnapshot(snapshot);
+    writeThrough('priceSnapshots', snapshot);
     set(state => ({ priceSnapshots: [snapshot, ...state.priceSnapshots] }));
   },
 
@@ -455,50 +195,216 @@ const useWheelStore = create(
   updatePosition: (id, data) => set(state => {
     const updated = state.positions.map(p => p.id === id ? { ...p, ...data } : p);
     const pos = updated.find(p => p.id === id);
-    if (pos) syncPosition(pos);
+    if (pos) writeThrough('positions', pos);
     return { positions: updated };
   }),
 
   deletePosition: (id) => {
-    deletePos(id);
+    deleteThrough('positions', id);
     set(state => ({ positions: state.positions.filter(p => p.id !== id) }));
   },
 
   addPosition: (position) => set(state => {
-    const newPos = { ...position, id: Math.max(0, ...state.positions.map(p => p.id)) + 1, status: 'OPEN', closedData: null, journalEntryIds: [] };
-    syncPosition(newPos);
+    const isShares = position.category === 'Long Shares';
+    const isCash   = position.category === 'Cash';
+    const newPos = {
+      ...position,
+      id: Math.max(0, ...state.positions.map(p => p.id)) + 1,
+      status: 'OPEN', closedData: null, journalEntryIds: [],
+      lifecycleStatus: isCash ? undefined : 'Open',
+      remainingQuantity: isCash ? undefined : isShares ? (position.shareCount || 0) : (position.contracts || 1),
+      partialRealizedPnL: 0,
+    };
+    writeThrough('positions', newPos);
+
+    // Every opening trade becomes a permanent ledger entry. Cash reservations
+    // aren't trades, so they're excluded — consistent with the backfill migration.
+    if (!isCash) {
+      const openQty = isShares ? (newPos.shareCount || 0) : (newPos.contracts || 1);
+      const action  = isShares ? 'Buy to Open' : 'Sell to Open';
+      const exec = {
+        positionId: newPos.id, campaignId: newPos.campaignId || null, symbol: newPos.symbol,
+        action, date: newPos.entryDate, quantity: openQty,
+        executionPrice: isShares ? (newPos.purchasePrice || 0) : (newPos.premium || 0) / (openQty * 100 || 1),
+        netCreditDebit: isShares ? -(newPos.purchasePrice || 0) * openQty : (newPos.premium || 0),
+        commission: newPos.commission || 0, exchangeFees: newPos.exchangeFees || 0, gst: newPos.gst || 0,
+        notes: '', linkedPositionId: null,
+        importFingerprint: position.importFingerprint || null,
+      };
+      addExecution(exec).catch(err => console.error('[addPosition] failed to record execution', err));
+      get().createAutoJournalEntry(newPos, exec, action);
+    }
+
     return { positions: [...state.positions, newPos] };
   }),
 
-  // Close a position — category-aware P&L calculation
+  // Close (fully or partially) a position — category-aware P&L calculation.
+  // closeData.quantity enables partial closes; omitted, it defaults to the
+  // position's full remaining quantity (fully backward compatible with every
+  // existing call site). closeData.action drives the new Action taxonomy
+  // (Buy to Close/Sell to Close/Assignment/Exercise/Expired/Roll) and falls
+  // back to closeData.reason for older callers.
   closePosition: (positionId, closeData) => set(state => {
     const pos = state.positions.find(p => p.id === positionId);
     if (!pos) return state;
 
-    let realizedPnL = 0;
+    const isShares = pos.category === 'Long Shares';
+    const isCash   = pos.category === 'Cash';
+    const startingRemaining = pos.remainingQuantity ?? (isShares ? pos.shareCount : pos.contracts) ?? 1;
+    const closeQty = closeData.quantity ?? closeData.shares ?? startingRemaining;
+    const isFullClose = closeQty >= startingRemaining;
+
+    let thisCloseRealizedPnL = 0;
     if (isOptCat(pos.category)) {
-      const buybackTotal = (closeData.buybackCost || 0) * (pos.contracts || 1) * 100;
-      realizedPnL = (pos.premium || 0) - buybackTotal - (closeData.fees || 0);
-    } else if (pos.category === 'Long Shares') {
+      const buybackTotal   = (closeData.buybackCost || 0) * closeQty * 100;
+      const premiumPortion = (pos.premium || 0) * (closeQty / (pos.contracts || 1));
+      thisCloseRealizedPnL = premiumPortion - buybackTotal - (closeData.fees || 0);
+    } else if (isShares) {
       const gainPerShare = (closeData.salePrice || 0) - effectiveCostBasis(pos);
-      realizedPnL = gainPerShare * (closeData.shares || pos.shareCount || 0) - (closeData.fees || 0);
-    } else if (pos.category === 'Cash') {
-      realizedPnL = 0;
+      thisCloseRealizedPnL = gainPerShare * closeQty - (closeData.fees || 0);
+    } // Cash: 0, unchanged
+
+    const newRemaining   = startingRemaining - closeQty;
+    const action         = closeData.action || closeData.reason;
+    const lifecycleStatus = !isFullClose ? 'Partial'
+      : action === 'Assignment' ? 'Assigned'
+      : action === 'Expired'    ? 'Expired'
+      : action === 'Roll'       ? 'Rolled'
+      : 'Closed';
+    const accumulatedPnL = (pos.partialRealizedPnL || 0) + thisCloseRealizedPnL;
+
+    const updated = {
+      ...pos,
+      remainingQuantity: newRemaining,
+      partialRealizedPnL: isFullClose ? (pos.partialRealizedPnL || 0) : accumulatedPnL,
+      lifecycleStatus,
+      ...(isFullClose ? {
+        status: 'CLOSED',
+        closedData: {
+          closedDate: new Date().toISOString().split('T')[0],
+          ...closeData,
+          realizedPnL: accumulatedPnL,
+        },
+      } : {}),
+    };
+    writeThrough('positions', updated);
+
+    if (!isCash) {
+      const execAction = action || (isShares ? 'Sell to Close' : 'Buy to Close');
+      const exec = {
+        positionId, campaignId: pos.campaignId || null, symbol: pos.symbol,
+        action: execAction,
+        date: updated.closedData?.closedDate || new Date().toISOString().split('T')[0],
+        quantity: closeQty,
+        executionPrice: closeData.buybackCost ?? closeData.salePrice ?? null,
+        netCreditDebit: thisCloseRealizedPnL,
+        commission: 0, exchangeFees: closeData.fees || 0, gst: closeData.gst || 0,
+        notes: closeData.notes || '', linkedPositionId: null,
+        importFingerprint: closeData.importFingerprint || null,
+      };
+      addExecution(exec).catch(err => console.error('[closePosition] failed to record execution', err));
+      // Auto-journal only on a full close — a partial close is none of
+      // "opened, closed, rolled, assigned, or expires" on its own.
+      if (isFullClose) get().createAutoJournalEntry(updated, exec, execAction);
     }
 
-    const closed = { ...pos, status: 'CLOSED', closedData: { closedDate: new Date().toISOString().split('T')[0], ...closeData, realizedPnL } };
-    syncPosition(closed);
-    return { positions: state.positions.map(p => p.id === positionId ? closed : p) };
+    return { positions: state.positions.map(p => p.id === positionId ? updated : p) };
   }),
 
   // Reopen a closed position — clears closedData and restores OPEN status
   reopenPosition: (positionId) => set(state => {
     const pos = state.positions.find(p => p.id === positionId);
     if (!pos || pos.status !== 'CLOSED') return state;
-    const reopened = { ...pos, status: 'OPEN', closedData: null };
-    syncPosition(reopened);
+    const reopened = {
+      ...pos, status: 'OPEN', closedData: null,
+      lifecycleStatus: pos.category === 'Cash' ? undefined : 'Open',
+      remainingQuantity: pos.category === 'Cash' ? undefined
+        : pos.category === 'Long Shares' ? (pos.shareCount || 0) : (pos.contracts || 1),
+    };
+    writeThrough('positions', reopened);
     return { positions: state.positions.map(p => p.id === positionId ? reopened : p) };
   }),
+
+  // Roll a position — closes the old leg in full and opens a new linked leg
+  // in one combined action, computing the net credit/debit across both.
+  rollPosition: (oldPositionId, rollData) => set(state => {
+    const oldPos = state.positions.find(p => p.id === oldPositionId);
+    if (!oldPos) return state;
+
+    const oldContracts   = oldPos.contracts || 1;
+    const oldBuybackCost = rollData.buybackCost || 0;
+    const oldFees        = rollData.oldFees || 0;
+    const oldRealizedPnL = (oldPos.premium || 0) - (oldBuybackCost * oldContracts * 100) - oldFees;
+
+    const newId = Math.max(0, ...state.positions.map(p => p.id)) + 1;
+
+    const closedOld = {
+      ...oldPos,
+      status: 'CLOSED', lifecycleStatus: 'Rolled', remainingQuantity: 0,
+      rolledInto: newId,
+      closedData: {
+        closedDate: rollData.newEntryDate || new Date().toISOString().split('T')[0],
+        buybackCost: oldBuybackCost, fees: oldFees, reason: 'Roll', action: 'Roll',
+        realizedPnL: (oldPos.partialRealizedPnL || 0) + oldRealizedPnL,
+      },
+    };
+
+    const newPos = {
+      symbol: oldPos.symbol, category: oldPos.category, campaignId: oldPos.campaignId,
+      id: newId, status: 'OPEN', closedData: null, journalEntryIds: [],
+      entryDate: rollData.newEntryDate, strike: rollData.newStrike, expiry: rollData.newExpiry,
+      dte: rollData.newDte, premium: rollData.newPremium, contracts: rollData.newContracts || oldContracts,
+      currentValue: rollData.newPremium,
+      lifecycleStatus: 'Open', remainingQuantity: rollData.newContracts || oldContracts, partialRealizedPnL: 0,
+      openedFrom: oldPositionId, thesis: oldPos.thesis, notes: rollData.notes || '',
+    };
+
+    writeThrough('positions', closedOld);
+    writeThrough('positions', newPos);
+
+    const closeExec = {
+      positionId: oldPositionId, campaignId: oldPos.campaignId || null, symbol: oldPos.symbol,
+      action: 'Roll', date: closedOld.closedData.closedDate, quantity: oldContracts,
+      executionPrice: oldBuybackCost, netCreditDebit: -(oldBuybackCost * oldContracts * 100) - oldFees,
+      commission: 0, exchangeFees: oldFees, gst: 0, notes: 'Roll — closing leg', linkedPositionId: newId,
+    };
+    const openExec = {
+      positionId: newId, campaignId: newPos.campaignId || null, symbol: newPos.symbol,
+      action: 'Sell to Open', date: newPos.entryDate, quantity: newPos.contracts,
+      executionPrice: (rollData.newPremium || 0) / (newPos.contracts * 100 || 1),
+      netCreditDebit: (rollData.newPremium || 0) - (rollData.newFees || 0),
+      commission: 0, exchangeFees: rollData.newFees || 0, gst: 0, notes: 'Roll — opening leg', linkedPositionId: null,
+    };
+    addExecution(closeExec).catch(err => console.error('[rollPosition] failed to record closing execution', err));
+    addExecution(openExec).catch(err => console.error('[rollPosition] failed to record opening execution', err));
+
+    // One combined journal entry for the whole roll — not one per leg.
+    get().createAutoJournalEntry(closedOld, closeExec, 'Roll');
+
+    return { positions: [...state.positions.map(p => p.id === oldPositionId ? closedOld : p), newPos] };
+  }),
+
+  // Auto-generates a journal entry for a lifecycle event (opened/closed/
+  // rolled/assigned/expired). Reuses the existing addJournalEntryFromScenario
+  // write-through path verbatim.
+  createAutoJournalEntry: (position, execution, action) => {
+    const slug = (action || '').toLowerCase().replace(/\s+/g, '-');
+    get().addJournalEntryFromScenario({
+      id: Date.now(),
+      date: execution?.date || new Date().toISOString().split('T')[0],
+      symbol: position.symbol,
+      positionId: position.id,
+      trade: `${position.category} — ${action}`,
+      result: 'Auto-logged',
+      tags: ['auto-generated', slug],
+      tradeThesis: { reason: `${action} recorded automatically.`, support: '', target: '', happyAssignment: false },
+      simulatorRec: null,
+      myDecision: { action: '', reasoning: '', decidedDate: '' },
+      outcome: execution?.netCreditDebit != null
+        ? { completedDate: execution.date, action, finalProfit: execution.netCreditDebit, lesson: '' }
+        : { completedDate: '', action: '', finalProfit: null, lesson: '' },
+    });
+  },
 
   addCampaign: (campaign) => set(state => {
     const newCamp = {
@@ -507,19 +413,19 @@ const useWheelStore = create(
       createdDate: new Date().toISOString().split('T')[0],
       status: 'ACTIVE',
     };
-    syncCampaign(newCamp);
+    writeThrough('campaigns', newCamp);
     return { campaigns: [...state.campaigns, newCamp] };
   }),
 
   updateCampaign: (campaignId, data) => set(state => {
     const updated = state.campaigns.map(c => c.id === campaignId ? { ...c, ...data } : c);
     const camp = updated.find(c => c.id === campaignId);
-    if (camp) syncCampaign(camp);
+    if (camp) writeThrough('campaigns', camp);
     return { campaigns: updated };
   }),
 
   deleteCampaignById: (campaignId) => {
-    deleteCampaign(campaignId);
+    deleteThrough('campaigns', campaignId);
     set(state => ({ campaigns: state.campaigns.filter(c => c.id !== campaignId) }));
   },
 
@@ -578,7 +484,7 @@ const useWheelStore = create(
   })),
 
   addJournalEntry: (entry) => {
-    syncJournal(entry);
+    writeThrough('journal', entry);
     set(state => ({ journal: [entry, ...state.journal] }));
   },
 
@@ -617,26 +523,26 @@ const useWheelStore = create(
   updateWatchlistItem: (id, data) => set(state => {
     const updated = state.watchlist.map(w => w.id === id ? { ...w, ...data, lastUpdated: new Date().toISOString() } : w);
     const item = updated.find(w => w.id === id);
-    if (item) syncWatchlist(item);
+    if (item) writeThrough('watchlist', item);
     return { watchlist: updated };
   }),
   addWatchlistItem: (item) => set(state => {
     const newItem = { ...item, id: Math.max(0, ...state.watchlist.map(w => w.id)) + 1, lastUpdated: new Date().toISOString() };
-    syncWatchlist(newItem);
+    writeThrough('watchlist', newItem);
     return { watchlist: [...state.watchlist, newItem] };
   }),
   deleteWatchlistItem: (id) => {
-    deleteWatch(id);
+    deleteThrough('watchlist', id);
     set(state => ({ watchlist: state.watchlist.filter(w => w.id !== id) }));
   },
 
   addCalendarEvent: (event) => set(state => {
     const newEvent = { ...event, id: Math.max(0, ...state.calendar.map(e => e.id)) + 1 };
-    syncCalEvent(newEvent);
+    writeThrough('calendar', newEvent);
     return { calendar: [...state.calendar, newEvent] };
   }),
   deleteCalendarEvent: (id) => {
-    deleteCalEvent(id);
+    deleteThrough('calendar', id);
     set(state => ({
       calendar: state.calendar.filter(e => e.id !== id),
       selectedEvent: state.selectedEvent?.id === id ? null : state.selectedEvent,
@@ -652,7 +558,7 @@ const useWheelStore = create(
   })),
 
   addJournalEntryFromScenario: (entry) => {
-    syncJournal(entry);
+    writeThrough('journal', entry);
     set(state => ({ journal: [entry, ...state.journal] }));
   },
 
@@ -669,12 +575,12 @@ const useWheelStore = create(
         : e
     );
     const entry = updated.find(e => e.id === entryId);
-    if (entry) syncJournal(entry);
+    if (entry) writeThrough('journal', entry);
     return { journal: updated };
   }),
 
   deleteJournalEntry: (entryId) => {
-    deleteJournal(entryId);
+    deleteThrough('journal', entryId);
     set(state => ({
       journal: state.journal.filter(e => e.id !== entryId),
       positions: state.positions.map(p =>
@@ -711,7 +617,7 @@ const useWheelStore = create(
     if (existing) {
       const updated = { ...existing, simulatorRec: rec };
       set({ journal: journal.map(e => e.id === existing.id ? updated : e) });
-      syncJournal(updated);
+      writeThrough('journal', updated);
     } else {
       // No existing entry — create a skeleton linked to the simulated position
       const pos = simPos;
@@ -729,21 +635,37 @@ const useWheelStore = create(
         outcome:      { completedDate: '', action: '', finalProfit: null, lesson: '' },
       };
       set(s => ({ journal: [newEntry, ...s.journal] }));
-      syncJournal(newEntry);
+      writeThrough('journal', newEntry);
     }
   },
     }),
     {
       name:    'wheel-edge-store-v1',
       storage: createJSONStorage(() => localStorage),
-      // Don't persist transient UI state
+      // IndexedDB (src/services/db.js) is now the source of truth for the 6
+      // cloud-backed domains — they're excluded here so localStorage only
+      // keeps the local-only UI/calculator state that has no IndexedDB
+      // table. positions/campaigns/journal/calendar/watchlist/priceSnapshots
+      // are hydrated from IndexedDB on boot by IndexedDbInitializer instead.
       partialize: (state) => {
-        const { selectedEvent, tigerConnectionStatus, ...rest } = state;
+        const {
+          selectedEvent, tigerConnectionStatus, localSyncStatus,
+          positions, campaigns, journal, calendar, watchlist, priceSnapshots, executions,
+          ...rest
+        } = state;
         return rest;
       },
     }
   )
 );
+
+// writeThrough.js cannot import the store directly (db.js/writeThrough.js
+// are imported BY this file, so importing back would be circular) — this
+// registers a callback so every successful IndexedDB write bumps the
+// "🟢 Local Saved" status shown by SyncStatusIndicator.
+registerLocalSaveListener((savedAt) => {
+  useWheelStore.setState({ localSyncStatus: { savedAt } });
+});
 
 // ============================================================================
 // SIDEBAR COMPONENT
@@ -760,6 +682,7 @@ function Sidebar() {
     { name: 'Rotation Watchlist', path: '/watchlist',    icon: '👁️' },
     { name: 'Income Tracker',     path: '/income',       icon: '💰' },
     { name: 'Journal',            path: '/journal',      icon: '📝' },
+    { name: 'Backup',             path: '/backup',       icon: '☁️' },
     { name: 'Settings',           path: '/settings',     icon: '⚙️' },
   ];
   
@@ -819,7 +742,6 @@ function AccountSnapshot() {
   const journal   = useWheelStore(s => s.journal);
 
   const fmt  = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(n);
-  const fmtS = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
 
   // ── Derived from positions ──────────────────────────────────────────────────
   const openPositions = positions.filter(p => p.status === 'OPEN');
@@ -965,60 +887,122 @@ function AccountSnapshot() {
   );
 }
 
+// Compact sidebar badge — reflects manual cloud backup status (Supabase is
+// no longer "synced" live; it's a backup target the user controls via the
+// Save to Cloud button).
 function SupabaseStatusBadge() {
-  const status = useWheelStore(s => s.supabaseStatus);
-  const ok = status?.ok;
+  const [lastBackup, setLastBackup] = useState(null);
+  useEffect(() => { getLastCloudBackupAt().then(setLastBackup); }, []);
+  const backedUp = Boolean(lastBackup);
   return (
     <div className="flex items-center justify-between text-xs">
-      <span className="text-slate-500">Supabase</span>
+      <span className="text-slate-500">Cloud Backup</span>
       <div className="flex items-center gap-1">
-        <span className={`w-2 h-2 rounded-full ${ok ? 'bg-green-500' : 'bg-amber-400'}`} />
-        <span className={`font-semibold ${ok ? 'text-green-700' : 'text-amber-600'}`}>
-          {ok ? 'Synced' : 'Local Only'}
+        <span className={`w-2 h-2 rounded-full ${backedUp ? 'bg-green-500' : 'bg-amber-400'}`} />
+        <span className={`font-semibold ${backedUp ? 'text-green-700' : 'text-amber-600'}`}>
+          {backedUp ? 'Backed Up' : 'Not Backed Up'}
         </span>
       </div>
     </div>
   );
 }
 
-// ── Supabase Initializer ──────────────────────────────────────────────────────
-// Mounts once: loads data from Supabase, falls back to localStorage if needed.
+// ── IndexedDB Initializer ──────────────────────────────────────────────────────
+// Mounts once: hydrates the Zustand store from IndexedDB only. No network
+// call is ever made on boot — Supabase is a manual backup/restore target
+// the user triggers explicitly (Save to Cloud / Restore from Cloud), never
+// contacted automatically. IndexedDB is the only thing the app depends on
+// to function, including fully offline.
 
-function SupabaseInitializer() {
-  const setSupabaseStatus = useWheelStore(s => s.setSupabaseStatus);
+async function migrateLocalStorageOnce() {
+  const flag = await db.meta.get(LOCALSTORAGE_MIGRATION_FLAG);
+  if (flag) return; // already migrated, or this is a fresh install — never run again
 
-  useEffect(() => {
-    if (!isSupabaseConfigured()) {
-      setSupabaseStatus({ ok: false, reason: 'Not configured — add REACT_APP_SUPABASE_URL and REACT_APP_SUPABASE_ANON_KEY to .env' });
-      return;
-    }
-
-    loadAllFromSupabase().then(result => {
-      if (!result.ok) {
-        setSupabaseStatus({ ok: false, reason: result.reason });
-        return;
+  try {
+    const raw = localStorage.getItem(LEGACY_PERSIST_KEY);
+    if (raw) {
+      const legacyState = JSON.parse(raw)?.state || {};
+      for (const t of DOMAIN_TABLE_NAMES) {
+        const rows = legacyState[t];
+        // bulkPut on first-ever insert runs through the `creating` hook in
+        // db.js, which stamps _updatedAt/_dirty automatically — these rows
+        // have never been cloud-backed, so _dirty:1 is exactly correct.
+        if (Array.isArray(rows) && rows.length > 0) await db[t].bulkPut(rows);
       }
+    }
+  } catch (err) {
+    console.error('[Migration] Failed to migrate legacy localStorage data into IndexedDB', err);
+  }
 
-      // Supabase is reachable — always use it as the single source of truth.
-      // Whether it has data or is intentionally empty, hydrate the store from it.
-      // Never push local/mock data back to Supabase.
-      useWheelStore.setState({
-        positions:      result.positions,
-        campaigns:      result.campaigns,
-        journal:        result.journal,
-        calendar:       result.calendar,
-        watchlist:      result.watchlist,
-        priceSnapshots: result.priceSnapshots,
+  await db.meta.put({ key: LOCALSTORAGE_MIGRATION_FLAG, value: true });
+}
+
+const EXECUTION_LEDGER_BACKFILL_FLAG = 'executionLedgerBackfilled';
+
+// One-time migration: every position that existed before the execution
+// ledger shipped gets a synthesized opening (and closing, if applicable)
+// execution reconstructed from its existing fields, so the ledger is
+// complete from day one rather than having a gap before this feature.
+async function backfillExecutionLedgerOnce() {
+  if (await db.meta.get(EXECUTION_LEDGER_BACKFILL_FLAG)) return;
+
+  try {
+    const positions = await db.positions.toArray();
+    let nextId = Math.max(0, ...(await db.executions.toArray()).map(e => e.id)) + 1;
+    const now = new Date().toISOString();
+
+    for (const pos of positions) {
+      if (pos.category === 'Cash') continue; // reservations aren't trades
+
+      const isShares = pos.category === 'Long Shares';
+      const openQty  = isShares ? (pos.shareCount || 0) : (pos.contracts || 1);
+      await db.executions.add({
+        id: nextId++, positionId: pos.id, campaignId: pos.campaignId || null, symbol: pos.symbol,
+        action: isShares ? 'Buy to Open' : 'Sell to Open', date: pos.entryDate, quantity: openQty,
+        executionPrice: isShares ? (pos.purchasePrice || 0) : (pos.premium || 0) / (openQty * 100 || 1),
+        netCreditDebit: isShares ? -(pos.purchasePrice || 0) * openQty : (pos.premium || 0),
+        commission: pos.commission || 0, exchangeFees: 0, gst: 0,
+        notes: '[Backfilled from existing position record]', linkedPositionId: null,
+        _createdAt: now, _updatedAt: now, _dirty: 1,
       });
 
-      const count = result.positions.length;
-      setSupabaseStatus({
-        ok:     true,
-        reason: count > 0
-          ? `Loaded ${count} positions from Supabase`
-          : 'Supabase connected — database is empty',
-      });
-    });
+      if (pos.status === 'CLOSED' && pos.closedData) {
+        const reason = (pos.closedData.reason || '').toLowerCase();
+        const closeAction = reason.includes('assign') || reason.includes('call') ? 'Assignment'
+          : reason.includes('roll')  ? 'Roll'
+          : reason.includes('expir') ? 'Expired'
+          : isShares ? 'Sell to Close' : 'Buy to Close';
+        await db.executions.add({
+          id: nextId++, positionId: pos.id, campaignId: pos.campaignId || null, symbol: pos.symbol,
+          action: closeAction, date: pos.closedData.closedDate,
+          quantity: isShares ? (pos.closedData.shares || pos.shareCount || 0) : (pos.contracts || 1),
+          executionPrice: pos.closedData.buybackCost ?? pos.closedData.salePrice ?? null,
+          netCreditDebit: pos.closedData.realizedPnL ?? 0,
+          commission: 0, exchangeFees: pos.closedData.fees || 0, gst: 0,
+          notes: '[Backfilled from existing closedData]', linkedPositionId: null,
+          _createdAt: now, _updatedAt: now, _dirty: 1,
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Migration] Failed to backfill execution ledger', err);
+  }
+
+  await db.meta.put({ key: EXECUTION_LEDGER_BACKFILL_FLAG, value: true });
+}
+
+function IndexedDbInitializer() {
+  useEffect(() => {
+    (async () => {
+      await migrateLocalStorageOnce();
+      await backfillExecutionLedgerOnce();
+      const fresh = {};
+      for (const t of DOMAIN_TABLE_NAMES) {
+        fresh[t] = await db[t].toArray();
+      }
+      fresh.executions = await db.executions.toArray();
+      useWheelStore.setState(fresh);
+    })();
   }, []);
 
   return null; // invisible component
@@ -1412,7 +1396,6 @@ function CoveredCallCalc({ initialData, onUpdate }) {
   const totalProfit     = profitPerShare !== null ? profitPerShare * 100 : null;
 
   const isProfitable = selected !== null && hasInputs && selected >= minStrike;
-  const isLoss       = selected !== null && hasInputs && selected < minStrike;
   const pnlColor     = profitPerShare !== null ? (profitPerShare >= 0 ? 'text-green-700' : 'text-red-600') : 'text-slate-900';
 
   return (
@@ -1667,7 +1650,6 @@ function Dashboard() {
 
   // ── Three-way premium reporting ──────────────────────────────────────────
   const isOptPos    = p => isOptCat(p.category);
-  const currentYear = new Date().getFullYear().toString();
 
   // 1. PREMIUM COLLECTED — all credits received, both open and closed positions
   const allPremiumCollected = positions
@@ -1693,6 +1675,26 @@ function Dashboard() {
     .reduce((s, p) => s + (p.commission || 0), 0);
   const commissionsTotal = positions.reduce((s, p) => s + (p.commission || 0), 0);
   const netPremiumAfterCommissions = allPremiumCollected - commissionsTotal;
+
+  // ── New ledger-driven metrics ─────────────────────────────────────────────
+  const winRate       = calcWinRate(positions);
+  const closedOptsAll = positions.filter(p => p.status === 'CLOSED' && isOptPos(p));
+  const assignmentRate = closedOptsAll.length
+    ? Math.round((closedOptsAll.filter(p => p.lifecycleStatus === 'Assigned').length / closedOptsAll.length) * 100)
+    : 0;
+  const totalThetaCollected = openPositions.filter(isOptPos).reduce((s, p) => s + (p.theta || 0), 0);
+  const weeksElapsed = (() => {
+    const dates = positions.map(p => p.entryDate).filter(Boolean).sort();
+    if (!dates.length) return 1;
+    return Math.max(1, (Date.now() - new Date(dates[0]).getTime()) / 86400000 / 7);
+  })();
+  const avgPremiumPerWeek = allPremiumCollected / weeksElapsed;
+  const optPositionsWithStrike = positions.filter(p => isOptPos(p) && (p.premium || 0) > 0 && (p.strike || 0) > 0);
+  const avgPremiumPct = optPositionsWithStrike.length
+    ? optPositionsWithStrike.reduce((s, p) => s + (p.premium / (p.strike * (p.contracts || 1) * 100)) * 100, 0) / optPositionsWithStrike.length
+    : 0;
+  const totalNetPremium = allPremiumCollected - commissionsTotal
+    - positions.reduce((s, p) => s + (p.closedData?.fees || 0), 0);
 
   // Premium collected per month (by entry date) for Income Snapshot
   const premiumMonthMap = {};
@@ -1761,11 +1763,22 @@ function Dashboard() {
   return (
     <LayoutWrapper>
       <div className="p-8 space-y-6">
-        <div>
-          <h1 className="text-4xl font-bold text-slate-900 mb-2" style={{ fontFamily: 'Playfair Display, serif' }}>
-            Dashboard
-          </h1>
-          <p className="text-slate-600">Today's actions and key metrics</p>
+        <div className="flex items-start justify-between flex-wrap gap-4">
+          <div>
+            <h1 className="text-4xl font-bold text-slate-900 mb-2" style={{ fontFamily: 'Playfair Display, serif' }}>
+              Dashboard
+            </h1>
+            <p className="text-slate-600">Today's actions and key metrics</p>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex items-center gap-2">
+              <SaveToCloudButton />
+              <Link to="/backup" className="text-xs text-purple-600 hover:text-purple-800 font-semibold whitespace-nowrap">
+                Manage Backups →
+              </Link>
+            </div>
+            <SyncStatusIndicator compact />
+          </div>
         </div>
 
         {/* Stat cards — all 6 on one row */}
@@ -1776,6 +1789,16 @@ function Dashboard() {
           <StatCard compact title="Premium Collected"   value={`$${allPremiumCollected.toLocaleString()}`}                                                  subtitle="All credits received"  color="from-green-500 to-emerald-600" />
           <StatCard compact title="Realized Profit"     value={`${totalRealizedProfit >= 0 ? '+' : ''}$${Math.abs(totalRealizedProfit).toLocaleString()}`}  subtitle="Closed only"          color={totalRealizedProfit >= 0 ? 'from-teal-500 to-green-600' : 'from-red-500 to-orange-500'} />
           <StatCard compact title="Open Exposure"       value={`$${openPremiumExposure.toLocaleString()}`}                                                  subtitle="In open positions"    color="from-blue-500 to-cyan-500" />
+        </div>
+
+        {/* Trading Ledger metrics — second row */}
+        <div className="grid grid-cols-6 gap-3">
+          <StatCard compact title="Win Rate"            value={winRate != null ? `${winRate}%` : '—'}                                                       subtitle="Closed options"       color="from-emerald-500 to-green-600" />
+          <StatCard compact title="Assignment Rate"     value={`${assignmentRate}%`}                                                                         subtitle="Of closed options"    color="from-blue-500 to-indigo-600" />
+          <StatCard compact title="Avg Premium / Week"  value={`$${avgPremiumPerWeek.toFixed(0)}`}                                                           subtitle="Since first trade"    color="from-teal-500 to-cyan-600" />
+          <StatCard compact title="Avg Premium %"       value={`${avgPremiumPct.toFixed(2)}%`}                                                               subtitle="Of capital at risk"   color="from-purple-500 to-fuchsia-600" />
+          <StatCard compact title="Total Theta"         value={`$${totalThetaCollected.toFixed(2)}/d`}                                                       subtitle="Open positions"       color="from-orange-500 to-amber-600" />
+          <StatCard compact title="Total Net Premium"   value={`${totalNetPremium >= 0 ? '+' : ''}$${Math.abs(totalNetPremium).toLocaleString()}`}            subtitle="After all fees"       color={totalNetPremium >= 0 ? 'from-green-500 to-emerald-600' : 'from-red-500 to-orange-500'} />
         </div>
 
         {/* Top Performing Campaign */}
@@ -2266,6 +2289,10 @@ function EditPositionModal({ position, onSave, onClose }) {
                     className="w-full px-3 py-2 border border-amber-200 rounded-lg text-sm focus:ring-2 focus:ring-amber-400 bg-amber-50" />
                 </div>
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                {inp('Exchange Fees ($)', 'exchangeFees', 'number')}
+                {inp('GST ($)', 'gst', 'number')}
+              </div>
               {/* Option purchase price — shown for Naked Call/Put where user may have bought the option */}
               {(cat === 'Naked Call' || cat === 'Naked Put') && (
                 <div>
@@ -2283,6 +2310,34 @@ function EditPositionModal({ position, onSave, onClose }) {
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Thesis</label>
                 <textarea value={form.thesis ?? ''} onChange={e => upd('thesis', e.target.value)} rows={2}
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm resize-none focus:ring-2 focus:ring-purple-500" />
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                {inp('Underlying Price at Entry ($)', 'underlyingPriceAtEntry', 'number')}
+                {inp('Share Cost Basis Snapshot ($)', 'shareCostBasisSnapshot', 'number')}
+                {inp('Open Interest', 'openInterest', 'number')}
+              </div>
+              {cat === 'Covered Call' && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                    Shares Covered <span className="font-normal text-slate-400 normal-case">— defaults to contracts × 100</span>
+                  </label>
+                  <input type="number" value={form.sharesCovered ?? ''} onChange={on('sharesCovered')}
+                    placeholder={`${(form.contracts || 1) * 100}`}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
+                </div>
+              )}
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Exit Plan</label>
+                <input value={form.exitPlan ?? ''} onChange={e => upd('exitPlan', e.target.value)} placeholder="e.g. Close at 50% profit or 21 DTE"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Trade Tags <span className="font-normal text-slate-400 normal-case">comma-separated</span></label>
+                <input value={(form.tradeTags || []).join(', ')}
+                  onChange={e => upd('tradeTags', e.target.value.split(',').map(t => t.trim()).filter(Boolean))}
+                  placeholder="e.g. earnings-play, high-iv"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
               </div>
 
               {/* ── Naked option live analysis ─────────────────────────── */}
@@ -2446,6 +2501,13 @@ function EditPositionModal({ position, onSave, onClose }) {
                     Active — using ${form.avgPricePerShare}/sh · original purchase was ${form.purchasePrice}/sh
                   </p>
                 )}
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-amber-600 uppercase tracking-wide mb-1">Commission ($) <span className="normal-case text-slate-400 font-normal">optional</span></label>
+                <input type="number" step="0.01" min="0"
+                  value={form.commission ?? ''} onChange={e => upd('commission', e.target.value === '' ? null : Number(e.target.value))}
+                  placeholder="e.g. 1.30"
+                  className="w-full px-3 py-2 border border-amber-200 rounded-lg text-sm focus:ring-2 focus:ring-amber-400 bg-amber-50" />
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Notes</label>
@@ -2960,20 +3022,28 @@ function ClosePositionModal({ position, onClose }) {
   const isCash   = cat === 'Cash';
   const cfg      = POSITION_CATEGORIES[cat] || {};
 
+  const remainingQty = position.remainingQuantity ?? (isShares ? position.shareCount : position.contracts) ?? 1;
   const [form, setForm] = useState({
     buybackCost: '', salePrice: '', shares: String(position.shareCount || ''),
-    fees: '', reason: isOption ? 'Profit Target Reached' : isShares ? 'Called Away (CC)' : 'Capital Deployed',
+    quantity: String(remainingQty),
+    fees: '', exchangeFees: '', gst: '', notes: '',
+    action: isOption ? 'Buy to Close' : '',
+    reason: isShares ? 'Called Away (CC)' : isCash ? 'Capital Deployed' : '',
   });
   const [error, setError] = useState('');
   const upd = (f, v) => { setForm(p => ({ ...p, [f]: v })); if (error) setError(''); };
 
+  const closeQty = isOption ? (Number(form.quantity) || remainingQty) : (Number(form.shares) || position.shareCount || 0);
+  const isPartial = isOption && closeQty < remainingQty;
+
   let realizedPnL = 0, pnlBase = 0;
   if (isOption) {
-    const buybackTotal = (Number(form.buybackCost) || 0) * (position.contracts || 1) * 100;
-    realizedPnL = (position.premium || 0) - buybackTotal - (Number(form.fees) || 0);
-    pnlBase     = position.premium || 0;
+    const buybackTotal   = (Number(form.buybackCost) || 0) * closeQty * 100;
+    const premiumPortion = (position.premium || 0) * (closeQty / (position.contracts || 1));
+    realizedPnL = premiumPortion - buybackTotal - (Number(form.fees) || 0);
+    pnlBase     = premiumPortion;
   } else if (isShares) {
-    const sh   = Number(form.shares) || position.shareCount || 0;
+    const sh   = closeQty;
     const gain = ((Number(form.salePrice) || 0) - effectiveCostBasis(position)) * sh;
     realizedPnL = gain - (Number(form.fees) || 0);
     pnlBase     = effectiveCostBasis(position) * sh;
@@ -2983,10 +3053,15 @@ function ClosePositionModal({ position, onClose }) {
   const handleClose = () => {
     if (isOption && (form.buybackCost === '' || isNaN(Number(form.buybackCost)))) { setError('Buyback cost required (enter 0 if expiring worthless)'); return; }
     if (isShares && (!form.salePrice || isNaN(Number(form.salePrice)))) { setError('Sale price required'); return; }
+    if (isOption && (!form.quantity || Number(form.quantity) <= 0 || Number(form.quantity) > remainingQty)) { setError(`Quantity must be between 1 and ${remainingQty}`); return; }
     closePosition(position.id, {
       buybackCost: Number(form.buybackCost) || 0, salePrice: Number(form.salePrice) || 0,
       shares: Number(form.shares) || position.shareCount || 0,
-      fees: Number(form.fees) || 0, reason: form.reason,
+      quantity: isOption ? Number(form.quantity) : undefined,
+      fees: Number(form.fees) || 0, exchangeFees: Number(form.exchangeFees) || 0, gst: Number(form.gst) || 0,
+      notes: form.notes,
+      action: isOption ? form.action : undefined,
+      reason: isOption ? form.action : form.reason,
     });
     onClose();
   };
@@ -3022,9 +3097,29 @@ function ClosePositionModal({ position, onClose }) {
           {error && <p className="text-xs text-red-600 bg-red-50 px-3 py-2 rounded-lg">{error}</p>}
 
           {isOption && <>
-            {inp('Buyback Cost per Contract ($)', 'buybackCost', 'e.g. 0.50')}
-            <p className="text-xs text-slate-400 -mt-2">Enter 0 if expiring worthless</p>
-            {inp('Fees (optional)', 'fees', 'e.g. 1.30')}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Action</label>
+              <select value={form.action} onChange={e => upd('action', e.target.value)}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-purple-500">
+                {['Buy to Close', 'Assignment', 'Exercise', 'Expired'].map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {inp('Buyback Cost per Contract ($)', 'buybackCost', 'e.g. 0.50')}
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                  Quantity to Close <span className="text-blue-500 normal-case">of {remainingQty}</span>
+                </label>
+                <input type="number" step="1" min="1" max={remainingQty} value={form.quantity} onChange={e => upd('quantity', e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 -mt-2">Enter 0 buyback if expiring worthless. {isPartial && <span className="text-amber-600 font-semibold">Closing fewer than {remainingQty} leaves this position Partial.</span>}</p>
+            <div className="grid grid-cols-3 gap-3">
+              {inp('Fees (optional)', 'fees', 'e.g. 1.30')}
+              {inp('Exchange Fees (optional)', 'exchangeFees', 'e.g. 0.50')}
+              {inp('GST (optional)', 'gst', 'e.g. 0.10')}
+            </div>
           </>}
 
           {isShares && <>
@@ -3032,7 +3127,11 @@ function ClosePositionModal({ position, onClose }) {
               {inp('Sale Price per Share ($)', 'salePrice', `e.g. ${position.purchasePrice}`)}
               {inp('Shares', 'shares', `${position.shareCount}`)}
             </div>
-            {inp('Fees (optional)', 'fees', 'e.g. 2.50')}
+            <div className="grid grid-cols-3 gap-3">
+              {inp('Fees (optional)', 'fees', 'e.g. 2.50')}
+              {inp('Exchange Fees (optional)', 'exchangeFees', 'e.g. 0.50')}
+              {inp('GST (optional)', 'gst', 'e.g. 0.10')}
+            </div>
           </>}
 
           {isCash && (
@@ -3068,31 +3167,43 @@ function ClosePositionModal({ position, onClose }) {
             </div>
           )}
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Reason for Closure</label>
-            <select value={form.reason} onChange={e => upd('reason', e.target.value)}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-purple-500">
-              {(isOption
-                ? ['Profit Target Reached', 'Roll (Manual)', 'Stop Loss', 'Expiry — Worthless', 'Assignment', 'Other']
-                : isShares
+          {!isOption && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Reason for Closure</label>
+              <select value={form.reason} onChange={e => upd('reason', e.target.value)}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-purple-500">
+                {(isShares
                   ? ['Called Away (CC)', 'Sold for Profit', 'Stop Loss', 'Portfolio Rebalance', 'Other']
                   : ['Capital Deployed → Short Put', 'Deployed → Short Call', 'Capital Released', 'Other']
-              ).map(r => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </div>
+                ).map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+          )}
+
+          {isOption && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Notes (optional)</label>
+              <textarea value={form.notes} onChange={e => upd('notes', e.target.value)} rows={2}
+                placeholder="e.g. hit profit target, stopped out, IV crush..."
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm resize-none focus:ring-2 focus:ring-purple-500" />
+            </div>
+          )}
 
           {(isOption || isShares) && (
             <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 text-sm space-y-1.5">
               <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Realized P&L Preview</p>
               {isOption && <>
                 <div className="flex justify-between">
-                  <span className="text-slate-600">Premium Collected</span>
-                  <span className="font-semibold text-green-700">+${position.premium}</span>
+                  <span className="text-slate-600">Premium ({closeQty}/{position.contracts}× contracts)</span>
+                  <span className="font-semibold text-green-700">+${((position.premium || 0) * (closeQty / (position.contracts || 1))).toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-slate-600">Buyback Cost ({position.contracts}× × ${Number(form.buybackCost)||0} × 100)</span>
-                  <span className="font-semibold text-red-600">-${((Number(form.buybackCost)||0)*(position.contracts||1)*100).toFixed(0)}</span>
+                  <span className="text-slate-600">Buyback Cost ({closeQty}× × ${Number(form.buybackCost)||0} × 100)</span>
+                  <span className="font-semibold text-red-600">-${((Number(form.buybackCost)||0)*closeQty*100).toFixed(0)}</span>
                 </div>
+                {isPartial && (
+                  <p className="text-xs text-amber-600 font-semibold pt-1">⚠ Partial close — {remainingQty - closeQty} contract{remainingQty - closeQty !== 1 ? 's' : ''} will remain open.</p>
+                )}
               </>}
               {isShares && <>
                 <div className="flex justify-between">
@@ -3108,6 +3219,12 @@ function ClosePositionModal({ position, onClose }) {
                 <div className="flex justify-between">
                   <span className="text-slate-600">Fees</span>
                   <span className="font-semibold text-red-600">-${Number(form.fees)}</span>
+                </div>
+              )}
+              {(Number(form.exchangeFees) > 0 || Number(form.gst) > 0) && (
+                <div className="flex justify-between text-xs text-slate-400">
+                  <span>Exchange Fees / GST (tracked on ledger, not deducted from P&L)</span>
+                  <span>${(Number(form.exchangeFees) || 0).toFixed(2)} / ${(Number(form.gst) || 0).toFixed(2)}</span>
                 </div>
               )}
               <div className="flex justify-between pt-2 border-t border-slate-300">
@@ -3138,7 +3255,7 @@ function ClosePositionModal({ position, onClose }) {
 // ============================================================================
 
 // DTE = expiry − entry date in calendar days. Handles YYYY-MM-DD and human-readable formats.
-function calcDTE(entryDate, expiry) {
+export function calcDTE(entryDate, expiry) {
   if (!entryDate || !expiry) return null;
   const parse = s => {
     if (/^\d{4}-\d{2}-\d{2}$/.test(String(s))) return new Date(String(s) + 'T00:00:00');
@@ -3154,7 +3271,44 @@ function calcDTE(entryDate, expiry) {
 // Effective cost basis per share.
 // avgPricePerShare (set when multiple lots are averaged) takes priority over purchasePrice.
 // Use this everywhere share cost basis is required so all tabs stay in sync.
-const effectiveCostBasis = (p) => p.avgPricePerShare || p.purchasePrice || 0;
+export const effectiveCostBasis = (p) => p.avgPricePerShare || p.purchasePrice || 0;
+
+// Break-even price per share — computed on demand, never stored, since it's
+// fully derivable from existing fields (mirrors effectiveCostBasis's pattern).
+export function breakEvenPrice(p) {
+  const premiumPerShare = (p.premium || 0) / ((p.contracts || 1) * 100);
+  switch (p.category) {
+    case 'Short Put':
+    case 'Naked Put':    return (p.strike || 0) - premiumPerShare;
+    case 'Naked Call':   return (p.strike || 0) + premiumPerShare;
+    case 'Covered Call': return effectiveCostBasis(p) - premiumPerShare;
+    case 'Long Shares':  return effectiveCostBasis(p);
+    default:             return null; // Cash has no break-even
+  }
+}
+
+// Derives a campaign's overall status from its positions. Single source of
+// truth — both CampaignsPanel and JournalEntry call this instead of each
+// keeping their own copy of the same if/else chain.
+function deriveCampaignStatus(positions) {
+  const openOpts  = positions.filter(p => p.status === 'OPEN' && isOptCat(p.category));
+  const openSh    = positions.filter(p => p.status === 'OPEN' && p.category === 'Long Shares');
+  const openCount = positions.filter(p => p.status === 'OPEN').length;
+  if (openOpts.some(p => p.category === 'Covered Call')) return 'Active — Covered Call';
+  if (openSh.length > 0)                                 return 'Active — Holding Shares';
+  if (openOpts.some(p => p.category === 'Short Put'))    return 'Active — Short Put';
+  if (openCount > 0)                                     return 'Active';
+  return 'Closed';
+}
+
+// Win rate across closed option positions — generalized so the Dashboard
+// and JournalEntry both call the same logic instead of duplicating it.
+function calcWinRate(positions) {
+  const closedOpts = positions.filter(p => p.status === 'CLOSED' && isOptCat(p.category));
+  if (!closedOpts.length) return null;
+  const wins = closedOpts.filter(p => (p.closedData?.realizedPnL || 0) > 0).length;
+  return Math.round((wins / closedOpts.length) * 100);
+}
 
 // Campaign profit helper — returns all metrics including commissions as a separate line.
 // Commission is NEVER mixed into netPremium or realizedPnL — it is a pure drag metric.
@@ -3164,7 +3318,10 @@ function calcCampaignProfit(positions) {
   const isCash   = p => p.category === 'Cash';
 
   const netPremium        = positions.filter(isOption).reduce((s, p) => s + (p.premium || 0), 0);
-  const realizedPnL       = positions.filter(p => p.status === 'CLOSED').reduce((s, p) => s + (p.closedData?.realizedPnL || 0), 0);
+  // Realized P&L includes both fully-closed positions and the accumulated
+  // running total from positions that are only Partially closed so far.
+  const realizedPnL       = positions.filter(p => p.status === 'CLOSED').reduce((s, p) => s + (p.closedData?.realizedPnL || 0), 0)
+    + positions.filter(p => p.lifecycleStatus === 'Partial').reduce((s, p) => s + (p.partialRealizedPnL || 0), 0);
   const unrealizedPremium = positions.filter(p => p.status === 'OPEN' && isOption(p))
     .reduce((s, p) => s + (p.premium || 0) - (p.currentValue || 0), 0);
   const unrealizedShares  = positions.filter(p => p.status === 'OPEN' && isShares(p))
@@ -3173,7 +3330,23 @@ function calcCampaignProfit(positions) {
     .reduce((s, p) => s + (p.capitalAmount || 0), 0);
   // Commission — tracked separately across ALL position types, never subtracted from premium/P&L
   const totalCommissions  = positions.reduce((s, p) => s + (p.commission || 0), 0);
-  return { netPremium, realizedPnL, unrealizedPremium, unrealizedShares, cashReserved, totalCommissions };
+
+  // ── Campaign Analytics additions ──────────────────────────────────────
+  const totalFees             = positions.reduce((s, p) => s + (p.closedData?.fees || 0), 0);
+  const numberOfRolls         = positions.filter(p => p.lifecycleStatus === 'Rolled').length;
+  const callsAssigned         = positions.filter(p => isCallCat(p.category) && p.lifecycleStatus === 'Assigned').length;
+  const callsExpiredWorthless = positions.filter(p => isCallCat(p.category) && p.lifecycleStatus === 'Expired').length;
+  const openShares            = positions.filter(p => p.status === 'OPEN' && p.category === 'Long Shares');
+  const totalOpenShares       = openShares.reduce((s, p) => s + (p.shareCount || 0), 0);
+  const currentCostBasis      = totalOpenShares > 0
+    ? openShares.reduce((s, p) => s + effectiveCostBasis(p) * (p.shareCount || 0), 0) / totalOpenShares
+    : null;
+  const roi = netPremium > 0 ? (realizedPnL / netPremium) * 100 : null;
+
+  return {
+    netPremium, realizedPnL, unrealizedPremium, unrealizedShares, cashReserved, totalCommissions,
+    totalFees, numberOfRolls, callsAssigned, callsExpiredWorthless, currentCostBasis, roi,
+  };
 }
 
 // Campaign timeline — positions ordered by entryDate
@@ -3416,6 +3589,68 @@ function CampaignsPanel({ positions, activeCampaignId, onSelectCampaign }) {
                       className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs resize-none focus:ring-1 focus:ring-purple-400 focus:border-purple-400 bg-white" />
                   </div>
 
+                  {/* Campaign Analytics */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <p className="text-xs font-bold text-slate-400 uppercase tracking-wide">Campaign Analytics</p>
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                        deriveCampaignStatus(cPos).startsWith('Active') ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'
+                      }`}>{deriveCampaignStatus(cPos)}</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Total Premium</p>
+                        <p className="font-bold text-slate-800">${profit.netPremium.toLocaleString()}</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Total Fees</p>
+                        <p className="font-bold text-red-600">-${(profit.totalFees + profit.totalCommissions).toFixed(2)}</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Net Premium</p>
+                        <p className="font-bold text-slate-800">${(profit.netPremium - profit.totalFees - profit.totalCommissions).toFixed(2)}</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Rolls</p>
+                        <p className="font-bold text-purple-700">{profit.numberOfRolls}</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Calls Assigned</p>
+                        <p className="font-bold text-blue-700">{profit.callsAssigned}</p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Expired Worthless</p>
+                        <p className="font-bold text-slate-600">{profit.callsExpiredWorthless}</p>
+                      </div>
+                      {profit.currentCostBasis != null && (
+                        <div className="bg-slate-50 rounded-lg p-2">
+                          <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Cost Basis</p>
+                          <p className="font-bold text-slate-800">${profit.currentCostBasis.toFixed(2)}</p>
+                        </div>
+                      )}
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Realized P/L</p>
+                        <p className={`font-bold ${profit.realizedPnL >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                          {profit.realizedPnL >= 0 ? '+' : ''}${profit.realizedPnL.toFixed(0)}
+                        </p>
+                      </div>
+                      <div className="bg-slate-50 rounded-lg p-2">
+                        <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>Unrealized P/L</p>
+                        <p className={`font-bold ${(profit.unrealizedPremium + profit.unrealizedShares) >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                          {(profit.unrealizedPremium + profit.unrealizedShares) >= 0 ? '+' : ''}${(profit.unrealizedPremium + profit.unrealizedShares).toFixed(0)}
+                        </p>
+                      </div>
+                      {profit.roi != null && (
+                        <div className="bg-slate-50 rounded-lg p-2">
+                          <p className="text-slate-400 uppercase tracking-wide" style={{ fontSize: '9px' }}>ROI</p>
+                          <p className={`font-bold ${profit.roi >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                            {profit.roi >= 0 ? '+' : ''}{profit.roi.toFixed(1)}%
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
                   {/* Per-trade closed position P&L */}
                   {cPos.filter(p => p.status === 'CLOSED' && p.closedData).length > 0 && (
                     <div>
@@ -3483,8 +3718,10 @@ function AddPositionModal({ onClose }) {
   const [campaignId, setCampaignId] = useState(campaigns[0]?.id || '');
   const [form, setForm] = useState({
     symbol: '', entryDate: new Date().toISOString().split('T')[0],
+    commission: '',
     // options
     strike: '', expiry: '', dte: '', premium: '', contracts: '1',
+    exchangeFees: '', gst: '', underlyingPriceAtEntry: '', sharesCovered: '', exitPlan: '', tradeTags: '',
     // shares
     shareCount: '', purchasePrice: '',
     // cash
@@ -3506,10 +3743,18 @@ function AddPositionModal({ onClose }) {
       symbol: form.symbol.trim().toUpperCase(),
       category, campaignId: campaignId || null,
       entryDate: form.entryDate, notes: form.notes,
+      commission: Number(form.commission) || 0,
       ...(isOption ? {
         strike: Number(form.strike), expiry: form.expiry, dte: Number(form.dte) || null,
         premium: Number(form.premium), currentValue: Number(form.premium),
         contracts: Number(form.contracts) || 1,
+        exchangeFees: Number(form.exchangeFees) || 0, gst: Number(form.gst) || 0,
+        underlyingPriceAtEntry: form.underlyingPriceAtEntry ? Number(form.underlyingPriceAtEntry) : null,
+        sharesCovered: category === 'Covered Call'
+          ? (form.sharesCovered ? Number(form.sharesCovered) : (Number(form.contracts) || 1) * 100)
+          : null,
+        exitPlan: form.exitPlan || '',
+        tradeTags: form.tradeTags ? form.tradeTags.split(',').map(t => t.trim()).filter(Boolean) : [],
       } : {}),
       ...(isShares ? {
         shareCount:        Number(form.shareCount),
@@ -3587,6 +3832,17 @@ function AddPositionModal({ onClose }) {
             </div>
           </div>
 
+          {/* Commission — applies to every category, tracked separately from premium/P&L */}
+          <div>
+            <label className="block text-xs font-semibold text-amber-600 uppercase tracking-wide mb-1">
+              Commission ($) <span className="normal-case text-slate-400 font-normal">optional</span>
+            </label>
+            <input type="number" step="0.01" min="0"
+              value={form.commission} onChange={e => upd('commission', e.target.value)}
+              placeholder="e.g. 1.30"
+              className="w-full px-3 py-2 border border-amber-200 rounded-lg text-sm focus:ring-2 focus:ring-amber-400 bg-amber-50" />
+          </div>
+
           {/* Campaign */}
           <div>
             <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Campaign</label>
@@ -3625,6 +3881,31 @@ function AddPositionModal({ onClose }) {
                   {form.dte && <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-blue-400 pointer-events-none">days</span>}
                 </div>
               </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {inp('Exchange Fees (optional)', 'exchangeFees', 'number', 'e.g. 0.50')}
+              {inp('GST (optional)', 'gst', 'number', 'e.g. 0.10')}
+              {inp('Underlying Price at Entry ($)', 'underlyingPriceAtEntry', 'number', 'e.g. 374.60')}
+            </div>
+            {category === 'Covered Call' && (
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">
+                  Shares Covered <span className="font-normal text-slate-400 normal-case">— defaults to contracts × 100</span>
+                </label>
+                <input type="number" value={form.sharesCovered} onChange={e => upd('sharesCovered', e.target.value)}
+                  placeholder={`${(Number(form.contracts) || 1) * 100}`}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
+              </div>
+            )}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Exit Plan (optional)</label>
+              <input value={form.exitPlan} onChange={e => upd('exitPlan', e.target.value)} placeholder="e.g. Close at 50% profit or 21 DTE"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Trade Tags (optional, comma-separated)</label>
+              <input value={form.tradeTags} onChange={e => upd('tradeTags', e.target.value)} placeholder="e.g. earnings-play, high-iv"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500" />
             </div>
           </>}
 
@@ -3694,10 +3975,13 @@ function Positions() {
   const [journalDrawerPosition, setJournalDrawerPosition] = useState(null);
   const [historyPosition, setHistoryPosition] = useState(null);
   const [closingPosition, setClosingPosition] = useState(null);
+  const [rollingPosition, setRollingPosition] = useState(null);
+  const [lineagePosition, setLineagePosition] = useState(null);
   const [activeCampaign, setActiveCampaign] = useState(null);
   const [expandedClosedId, setExpandedClosedId] = useState(null);
   const [showAddModal,    setShowAddModal]    = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showPoemsImport, setShowPoemsImport] = useState(false);
   const campaigns = useWheelStore(s => s.campaigns);
 
   const handleExport = () => {
@@ -3845,6 +4129,11 @@ function Positions() {
               style={{ background: 'linear-gradient(135deg, #f97316 0%, #ef4444 100%)' }}>
               🐯 Import From Tiger
             </button>
+            <button onClick={() => setShowPoemsImport(true)}
+              className="px-4 py-2 text-sm font-semibold text-white rounded-lg shadow flex items-center gap-1.5"
+              style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }}>
+              📄 Import POEMS Contract Note
+            </button>
             <button onClick={handleExport}
               className="px-4 py-2 text-sm font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition">
               📥 Export Excel
@@ -3933,10 +4222,23 @@ function Positions() {
                     <tr key={pos.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50'} ${isClosed ? 'opacity-65' : ''}`}>
                       {/* Status */}
                       <td className="px-4 py-3">
-                        <span className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-bold w-fit ${isOpen ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-500'}`}>
-                          <span className={`w-1.5 h-1.5 rounded-full ${isOpen ? 'bg-green-500' : 'bg-slate-400'}`} />
-                          {pos.status}
-                        </span>
+                        <div className="flex flex-col gap-1 items-start">
+                          <span className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-bold w-fit ${isOpen ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-500'}`}>
+                            <span className={`w-1.5 h-1.5 rounded-full ${isOpen ? 'bg-green-500' : 'bg-slate-400'}`} />
+                            {pos.status}
+                          </span>
+                          {pos.lifecycleStatus && pos.lifecycleStatus !== 'Open' && pos.lifecycleStatus !== 'Closed' && (
+                            <span className={`px-1.5 py-0.5 rounded text-xs font-semibold w-fit ${
+                              pos.lifecycleStatus === 'Partial'  ? 'bg-amber-100 text-amber-700'
+                              : pos.lifecycleStatus === 'Assigned' ? 'bg-blue-100 text-blue-700'
+                              : pos.lifecycleStatus === 'Rolled'   ? 'bg-purple-100 text-purple-700'
+                              : pos.lifecycleStatus === 'Expired'  ? 'bg-slate-200 text-slate-600'
+                              : 'bg-slate-100 text-slate-600'
+                            }`}>
+                              {pos.lifecycleStatus}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       {/* Category */}
                       <td className="px-4 py-3">
@@ -3971,22 +4273,34 @@ function Positions() {
                               className="px-2 py-1 text-xs font-semibold bg-slate-200 text-slate-700 rounded">No</button>
                           </div>
                         ) : isOpen ? (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
                             <button onClick={() => setEditingPosition(pos)}
                               className="px-2 py-1 text-xs font-semibold text-purple-700 bg-purple-100 rounded hover:bg-purple-200">✏️ Edit</button>
                             <button onClick={() => setClosingPosition(pos)}
                               className="px-2 py-1 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-700">✕ Close</button>
+                            {isOption && (
+                              <button onClick={() => setRollingPosition(pos)}
+                                className="px-2 py-1 text-xs font-semibold text-blue-700 bg-blue-100 rounded hover:bg-blue-200">🔄 Roll</button>
+                            )}
+                            {(pos.openedFrom != null || pos.rolledInto != null || pos.closedBy != null || pos.replacementPosition != null) && (
+                              <button onClick={() => setLineagePosition(pos)}
+                                className="px-2 py-1 text-xs font-semibold text-indigo-700 bg-indigo-100 rounded hover:bg-indigo-200">🔗 Lineage</button>
+                            )}
                             <button onClick={() => setConfirmDeleteId(pos.id)}
                               className="px-2 py-1 text-xs font-semibold text-red-700 bg-red-100 rounded hover:bg-red-200">🗑️</button>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
                             <button onClick={() => setExpandedClosedId(isExpanded ? null : pos.id)}
                               className="px-2 py-1 text-xs font-semibold text-slate-600 bg-slate-100 rounded hover:bg-slate-200">
                               {isExpanded ? '▲ Hide' : '▼ Details'}
                             </button>
                             <button onClick={() => setEditingPosition(pos)}
                               className="px-2 py-1 text-xs font-semibold text-purple-700 bg-purple-100 rounded hover:bg-purple-200">✏️ Edit</button>
+                            {(pos.openedFrom != null || pos.rolledInto != null || pos.closedBy != null || pos.replacementPosition != null) && (
+                              <button onClick={() => setLineagePosition(pos)}
+                                className="px-2 py-1 text-xs font-semibold text-indigo-700 bg-indigo-100 rounded hover:bg-indigo-200">🔗 Lineage</button>
+                            )}
                             <button onClick={() => reopenPosition(pos.id)}
                               className="px-2 py-1 text-xs font-semibold text-green-700 bg-green-100 rounded hover:bg-green-200">↩ Reopen</button>
                             <button onClick={() => setConfirmDeleteId(pos.id)}
@@ -4026,6 +4340,8 @@ function Positions() {
 
       {showImportModal && <ImportFromTigerModal onClose={() => setShowImportModal(false)} />}
 
+      {showPoemsImport && <PoemsImportWizard onClose={() => setShowPoemsImport(false)} />}
+
       {editingPosition && (
         <EditPositionModal
           position={editingPosition}
@@ -4038,6 +4354,21 @@ function Positions() {
         <ClosePositionModal
           position={closingPosition}
           onClose={() => setClosingPosition(null)}
+        />
+      )}
+
+      {rollingPosition && (
+        <RollPositionModal
+          position={rollingPosition}
+          onClose={() => setRollingPosition(null)}
+        />
+      )}
+
+      {lineagePosition && (
+        <PositionLineageTimeline
+          position={lineagePosition}
+          allPositions={positions}
+          onClose={() => setLineagePosition(null)}
         />
       )}
 
@@ -5366,7 +5697,6 @@ function DecisionQualityCalculator({ snapshotRef }) {
 function ScenarioSimulator() {
   const positions                   = useWheelStore((s) => s.positions);
   const journal                     = useWheelStore((s) => s.journal);
-  const updatePositionStatus        = useWheelStore((s) => s.updatePositionStatus);
   const addJournalEntryFromScenario = useWheelStore((s) => s.addJournalEntryFromScenario);
   const updateJournalEntry          = useWheelStore((s) => s.updateJournalEntry);
 
@@ -5418,7 +5748,6 @@ function ScenarioSimulator() {
   const priceTrack = isCC
     ? `linear-gradient(to right, #22c55e 0%, #22c55e ${strikePct.toFixed(1)}%, #eab308 ${Math.min(strikePct + 8, 100).toFixed(1)}%, #ef4444 100%)`
     : `linear-gradient(to right, #ef4444 0%, #eab308 ${strikePct.toFixed(1)}%, #22c55e ${Math.min(strikePct + 8, 100).toFixed(1)}%, #22c55e 100%)`;
-  const dtePct     = position ? ((simDTE / position.dte) * 100).toFixed(1) : 50;
   // dteTrack kept for reference (replaced by per-slider IIFE gradient)
 
   const recPalette = {
@@ -7638,32 +7967,28 @@ function JournalEntry({ entry, positions, campaigns }) {
 
   // ── Campaign Results ──────────────────────────────────────────────
   const camResults = camPositions.length > 0 ? (() => {
-    const { netPremium: premiumCollected, realizedPnL, unrealizedPremium, unrealizedShares } = calcCampaignProfit(camPositions);
-    const isOption  = p => isOptCat(p.category);
+    const { netPremium: premiumCollected, realizedPnL, unrealizedPremium, unrealizedShares, totalFees, totalCommissions } = calcCampaignProfit(camPositions);
     const isShares  = p => p.category === 'Long Shares';
-    const openOpts  = camPositions.filter(p => p.status === 'OPEN' && isOption(p));
     const openSh    = camPositions.filter(p => p.status === 'OPEN' && isShares(p));
-    const openCount = camPositions.filter(p => p.status === 'OPEN').length;
 
-    let campaignStatus = 'Closed';
-    if (openOpts.some(p => p.category === 'Covered Call'))   campaignStatus = 'Active — Covered Call';
-    else if (openSh.length > 0)                              campaignStatus = 'Active — Holding Shares';
-    else if (openOpts.some(p => p.category === 'Short Put')) campaignStatus = 'Active — Short Put';
-    else if (openCount > 0)                                  campaignStatus = 'Active';
+    // Single source of truth — same function CampaignsPanel calls.
+    const campaignStatus = deriveCampaignStatus(camPositions);
 
-    const rolls       = camPositions.filter(p => p.status === 'CLOSED' && (p.closedData?.reason || '').toLowerCase().includes('roll')).length;
+    // Prefer the structured lifecycleStatus field; fall back to string-matching
+    // closedData.reason for positions that predate this field (e.g. not yet
+    // backfilled). Both paths give the same answer for current data.
+    const rolls       = camPositions.filter(p => p.lifecycleStatus === 'Rolled' || (p.status === 'CLOSED' && (p.closedData?.reason || '').toLowerCase().includes('roll'))).length;
     const sharesOwned = openSh.reduce((s, p) => s + (p.shareCount || 0), 0);
-    const assignments = camPositions.filter(p => p.status === 'CLOSED' && (p.closedData?.reason || '').toLowerCase().includes('assign')).length;
+    const assignments = camPositions.filter(p => p.lifecycleStatus === 'Assigned' || (p.status === 'CLOSED' && (p.closedData?.reason || '').toLowerCase().includes('assign'))).length;
     const calledAway  = camPositions.filter(p => p.status === 'CLOSED' && isShares(p)).length;
     const wheelCycles = Math.min(assignments, calledAway);
 
-    const closedOpts  = camPositions.filter(p => p.status === 'CLOSED' && isOption(p));
-    const wins        = closedOpts.filter(p => (p.closedData?.realizedPnL || 0) > 0).length;
-    const winRate     = closedOpts.length > 0 ? Math.round((wins / closedOpts.length) * 100) : null;
+    const winRate     = calcWinRate(camPositions);
     const roi         = premiumCollected > 0 ? ((realizedPnL / premiumCollected) * 100).toFixed(1) : null;
     const unrealized  = unrealizedPremium + unrealizedShares;
 
-    return { campaignStatus, premiumCollected, realizedPnL, unrealized, sharesOwned, assignments, calledAway, rolls, wheelCycles, winRate, roi };
+    return { campaignStatus, premiumCollected, realizedPnL, unrealized, sharesOwned, assignments, calledAway,
+             rolls, wheelCycles, winRate, roi, totalFees: totalFees + totalCommissions };
   })() : null;
 
   const recColors = {
@@ -8053,6 +8378,12 @@ function JournalEntry({ entry, positions, campaigns }) {
                     </span>
                   </div>
                 )}
+                {camResults.totalFees > 0 && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Total Fees</span>
+                    <span className="font-semibold text-red-600">-${camResults.totalFees.toFixed(2)}</span>
+                  </div>
+                )}
                 {camResults.sharesOwned > 0 && (
                   <div className="flex justify-between">
                     <span className="text-slate-500">Shares Owned</span>
@@ -8319,6 +8650,53 @@ function Journal() {
 // SETTINGS PAGE
 // ============================================================================
 
+// ============================================================================
+// BACKUP PAGE
+// ============================================================================
+
+function Backup() {
+  return (
+    <LayoutWrapper>
+      <div className="p-8 space-y-6 max-w-3xl">
+        <div>
+          <h1 className="text-4xl font-bold text-slate-900 mb-2" style={{ fontFamily: 'Playfair Display, serif' }}>
+            Backup
+          </h1>
+          <p className="text-slate-600">
+            IndexedDB is your local database — it's always the source of truth and works fully offline.
+            Supabase is a manual cloud backup you control.
+          </p>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <SyncStatusIndicator />
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <h3 className="text-sm font-bold text-slate-900 mb-1">Cloud Backup</h3>
+          <p className="text-xs text-slate-500 mb-4">
+            Save uploads every record from your local database to Supabase. Restore lets you
+            pull the cloud copy back down — you'll always see what's different before anything changes.
+          </p>
+          <div className="flex gap-3">
+            <SaveToCloudButton />
+            <RestoreFromCloudButton />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <h3 className="text-sm font-bold text-slate-900 mb-1">Local Version History</h3>
+          <p className="text-xs text-slate-500 mb-4">
+            A snapshot of your entire local database is saved automatically every time you add, edit,
+            or delete something. The last 30 are kept — restore any of them without needing the cloud.
+          </p>
+          <SnapshotHistoryList />
+        </div>
+      </div>
+    </LayoutWrapper>
+  );
+}
+
 function Settings() {
   return (
     <LayoutWrapper>
@@ -8398,7 +8776,7 @@ function StatCard({ title, value, subtitle, color, compact = false }) {
 function App() {
   return (
     <BrowserRouter>
-      <SupabaseInitializer />
+      <IndexedDbInitializer />
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/positions" element={<Positions />} />
@@ -8407,6 +8785,7 @@ function App() {
         <Route path="/watchlist" element={<RotationWatchlist />} />
         <Route path="/income" element={<IncomeTracker />} />
         <Route path="/journal" element={<Journal />} />
+        <Route path="/backup" element={<Backup />} />
         <Route path="/settings" element={<Settings />} />
       </Routes>
     </BrowserRouter>

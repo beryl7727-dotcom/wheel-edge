@@ -1,10 +1,11 @@
 /**
- * Wheel Edge — Supabase Sync Service
+ * Wheel Edge — Supabase Mapping & Read Service
  *
- * All writes are optimistic: Zustand updates immediately, Supabase syncs in
- * the background.  Reads on startup populate the Zustand store from Supabase
- * (source of truth).  Falls back to localStorage cache if Supabase is
- * unreachable.
+ * IndexedDB (src/services/db.js) is the source of truth the app runs on.
+ * Supabase is a MANUAL cloud backup/restore target only — nothing in this
+ * file writes to Supabase automatically. The mappers below convert between
+ * the app's camelCase records and Supabase's snake_case rows; they're used
+ * by cloudBackup.js (upload) and cloudRestore.js (download/diff/merge).
  *
  * Column naming: JS camelCase → DB snake_case via the mappers below.
  * Complex nested objects are stored as JSONB in an `extra` column so we never
@@ -59,6 +60,23 @@ export const toDbPosition = (p) => ({
     avgPricePerShare: p.avgPricePerShare  ?? null,
     impliedVolatility:   p.impliedVolatility   ?? null,
     optionPurchasePrice: p.optionPurchasePrice ?? null,
+    // Execution ledger upgrade — new position-level fields, no schema
+    // migration needed since extra is a JSONB catch-all.
+    sharesCovered:          p.sharesCovered          ?? null,
+    underlyingPriceAtEntry: p.underlyingPriceAtEntry ?? null,
+    shareCostBasisSnapshot: p.shareCostBasisSnapshot ?? null,
+    openInterest:           p.openInterest           ?? null,
+    exitPlan:               p.exitPlan               || null,
+    tradeTags:              p.tradeTags              || [],
+    openedFrom:             p.openedFrom             ?? null,
+    rolledInto:             p.rolledInto             ?? null,
+    closedBy:               p.closedBy               ?? null,
+    replacementPosition:    p.replacementPosition    ?? null,
+    remainingQuantity:      p.remainingQuantity      ?? null,
+    partialRealizedPnL:     p.partialRealizedPnL     ?? 0,
+    lifecycleStatus:        p.lifecycleStatus        || null,
+    exchangeFees:           p.exchangeFees           ?? null,
+    gst:                    p.gst                    ?? null,
   },
 });
 
@@ -96,6 +114,22 @@ export const fromDbPosition = (row) => ({
   avgPricePerShare:  row.extra?.avgPricePerShare  ?? null,
   impliedVolatility:   row.extra?.impliedVolatility   ?? null,
   optionPurchasePrice: row.extra?.optionPurchasePrice ?? null,
+  sharesCovered:          row.extra?.sharesCovered          ?? null,
+  underlyingPriceAtEntry: row.extra?.underlyingPriceAtEntry ?? null,
+  shareCostBasisSnapshot: row.extra?.shareCostBasisSnapshot ?? null,
+  openInterest:           row.extra?.openInterest           ?? null,
+  exitPlan:               row.extra?.exitPlan               ?? null,
+  tradeTags:              row.extra?.tradeTags              || [],
+  openedFrom:             row.extra?.openedFrom             ?? null,
+  rolledInto:             row.extra?.rolledInto             ?? null,
+  closedBy:               row.extra?.closedBy               ?? null,
+  replacementPosition:    row.extra?.replacementPosition    ?? null,
+  remainingQuantity:      row.extra?.remainingQuantity      ?? null,
+  partialRealizedPnL:     row.extra?.partialRealizedPnL     ?? 0,
+  lifecycleStatus:        row.extra?.lifecycleStatus        ?? null,
+  exchangeFees:           row.extra?.exchangeFees           ?? null,
+  gst:                    row.extra?.gst                    ?? null,
+  updatedAt:        row.updated_at,
 });
 
 export const toDbCampaign = (c) => ({
@@ -114,6 +148,7 @@ export const fromDbCampaign = (row) => ({
   createdDate: row.created_date,
   status:      row.status,
   notes:       row.notes,
+  updatedAt:   row.updated_at,
 });
 
 export const toDbJournalEntry = (e) => ({
@@ -146,6 +181,7 @@ export const fromDbJournalEntry = (row) => ({
   myDecision:    row.my_decision,
   outcome:       row.outcome,
   editHistory:   row.edit_history || [],
+  updatedAt:     row.updated_at,
 });
 
 export const toDbCalendarEvent = (e) => ({
@@ -170,6 +206,7 @@ export const fromDbCalendarEvent = (row) => ({
   iconEmoji:   row.icon_emoji,
   notes:       row.notes,
   description: row.description,
+  updatedAt:   row.updated_at,
 });
 
 export const toDbWatchlistItem = (w) => ({
@@ -194,6 +231,7 @@ export const fromDbWatchlistItem = (row) => ({
   bias:        row.bias,
   notes:       row.notes,
   lastUpdated: row.last_updated,
+  updatedAt:   row.updated_at,
 });
 
 export const toDbSnapshot = (s) => ({
@@ -222,21 +260,47 @@ export const fromDbSnapshot = (row) => ({
   recommendation: row.recommendation,
   notes:         row.notes,
   bidAsk:        row.bid_ask,
+  updatedAt:     row.updated_at,
+});
+
+// Executions — the immutable trade ledger. No update semantics on the
+// Supabase side either; rows are only ever inserted, never upserted-over.
+export const toDbExecution = (e) => ({
+  id:                 e.id,
+  position_id:        e.positionId        ?? null,
+  campaign_id:        e.campaignId        || null,
+  symbol:             e.symbol            || null,
+  action:             e.action,
+  date:               e.date              || null,
+  quantity:           e.quantity          ?? null,
+  execution_price:    e.executionPrice    ?? null,
+  net_credit_debit:   e.netCreditDebit    ?? null,
+  commission:         e.commission        || 0,
+  exchange_fees:      e.exchangeFees      || 0,
+  gst:                e.gst               || 0,
+  notes:              e.notes             || null,
+  linked_position_id: e.linkedPositionId  ?? null,
+});
+
+export const fromDbExecution = (row) => ({
+  id:               row.id,
+  positionId:       row.position_id,
+  campaignId:       row.campaign_id,
+  symbol:           row.symbol,
+  action:           row.action,
+  date:             row.date,
+  quantity:         row.quantity,
+  executionPrice:   row.execution_price,
+  netCreditDebit:   row.net_credit_debit,
+  commission:       row.commission,
+  exchangeFees:     row.exchange_fees,
+  gst:              row.gst,
+  notes:            row.notes,
+  linkedPositionId: row.linked_position_id,
+  createdAt:        row.created_at,
 });
 
 // ─── Generic helpers ──────────────────────────────────────────────────────────
-
-async function upsert(table, row) {
-  if (!isSupabaseConfigured() || !supabase) return;
-  const { error } = await supabase.from(table).upsert(row, { onConflict: 'id' });
-  if (error) log('warn', `upsert ${table}`, error.message);
-}
-
-async function remove(table, id) {
-  if (!isSupabaseConfigured() || !supabase) return;
-  const { error } = await supabase.from(table).delete().eq('id', id);
-  if (error) log('warn', `delete ${table}:${id}`, error.message);
-}
 
 async function fetchAll(table) {
   if (!isSupabaseConfigured() || !supabase) return null;
@@ -245,31 +309,12 @@ async function fetchAll(table) {
   return data;
 }
 
-// ─── Public sync API ──────────────────────────────────────────────────────────
-
-export const syncPosition   = (p) => upsert('positions',      toDbPosition(p));
-export const deletePos      = (id) => remove('positions',     id);
-
-export const syncCampaign   = (c) => upsert('campaigns',      toDbCampaign(c));
-export const deleteCampaign = (id) => remove('campaigns',     id);
-
-export const syncJournal    = (e) => upsert('journal_entries', toDbJournalEntry(e));
-export const deleteJournal  = (id) => remove('journal_entries', id);
-
-export const syncCalEvent   = (e) => upsert('calendar_events', toDbCalendarEvent(e));
-export const deleteCalEvent = (id) => remove('calendar_events', id);
-
-export const syncWatchlist  = (w) => upsert('watchlist',       toDbWatchlistItem(w));
-export const deleteWatch    = (id) => remove('watchlist',      id);
-
-export const syncSnapshot   = (s) => upsert('recommendations', toDbSnapshot(s));
-
-// ─── Bootstrap: load all data from Supabase on startup ───────────────────────
+// ─── Read: fetch the full cloud snapshot (used by Restore from Cloud) ────────
 
 /**
- * Fetch every table and return camelCase objects ready for the Zustand store.
- * Returns null on any table if Supabase is unreachable — the caller should
- * fall back to localStorage.
+ * Fetch every table and return camelCase objects. Read-only — never called
+ * automatically; only invoked when the user clicks "Restore from Cloud".
+ * Returns {ok:false} on any table being unreachable.
  */
 export async function loadAllFromSupabase() {
   if (!isSupabaseConfigured() || !supabase) {
@@ -277,7 +322,7 @@ export async function loadAllFromSupabase() {
   }
 
   try {
-    const [posRows, campRows, journalRows, calRows, watchRows, snapRows] =
+    const [posRows, campRows, journalRows, calRows, watchRows, snapRows, execRows] =
       await Promise.all([
         fetchAll('positions'),
         fetchAll('campaigns'),
@@ -285,9 +330,10 @@ export async function loadAllFromSupabase() {
         fetchAll('calendar_events'),
         fetchAll('watchlist'),
         fetchAll('recommendations'),
+        fetchAll('executions'), // optional — table may not exist until schema.sql is re-run; treated as empty, not fatal
       ]);
 
-    // Any null = table missing or permission error
+    // Any null = table missing or permission error (executions excluded — optional/new)
     if ([posRows, campRows, journalRows, calRows, watchRows].includes(null)) {
       return { ok: false, reason: 'One or more tables unreachable' };
     }
@@ -300,33 +346,10 @@ export async function loadAllFromSupabase() {
       calendar:  calRows.map(fromDbCalendarEvent),
       watchlist: watchRows.map(fromDbWatchlistItem),
       priceSnapshots: (snapRows || []).map(fromDbSnapshot),
+      executions: (execRows || []).map(fromDbExecution),
     };
   } catch (err) {
     log('error', 'loadAllFromSupabase failed', err.message);
     return { ok: false, reason: err.message };
-  }
-}
-
-/**
- * Push the entire local Zustand state to Supabase (used for initial seed
- * when the database is empty).
- */
-export async function seedSupabaseFromLocal(state) {
-  if (!isSupabaseConfigured() || !supabase) return;
-
-  const batches = [
-    { table: 'positions',      rows: state.positions.map(toDbPosition) },
-    { table: 'campaigns',      rows: state.campaigns.map(toDbCampaign) },
-    { table: 'journal_entries', rows: state.journal.map(toDbJournalEntry) },
-    { table: 'calendar_events', rows: state.calendar.map(toDbCalendarEvent) },
-    { table: 'watchlist',      rows: state.watchlist.map(toDbWatchlistItem) },
-    { table: 'recommendations', rows: state.priceSnapshots.map(toDbSnapshot) },
-  ];
-
-  for (const { table, rows } of batches) {
-    if (!rows.length) continue;
-    const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
-    if (error) log('warn', `seed ${table}`, error.message);
-    else log('info', `seeded ${table}`, `${rows.length} rows`);
   }
 }

@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS calendar_events (
   icon_emoji  TEXT,
   notes       TEXT,
   description TEXT,
-  created_at  TIMESTAMPTZ  DEFAULT NOW()
+  created_at  TIMESTAMPTZ  DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ  DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_calendar_date     ON calendar_events(date);
@@ -126,13 +127,52 @@ CREATE TABLE IF NOT EXISTS recommendations (
   recommendation TEXT,
   notes          TEXT,
   bid_ask        JSONB,
-  created_at     TIMESTAMPTZ  DEFAULT NOW()
+  created_at     TIMESTAMPTZ  DEFAULT NOW(),
+  updated_at     TIMESTAMPTZ  DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_rec_position ON recommendations(position_id);
 CREATE INDEX IF NOT EXISTS idx_rec_symbol   ON recommendations(symbol);
 
+-- ── Executions (immutable trade ledger) ─────────────────────
+-- Every Sell to Open/Buy to Close/Assignment/Roll/etc. action becomes one
+-- permanent row here. No updated_at, no trigger — rows are only ever
+-- inserted, never updated, mirroring src/services/executions.js which
+-- exposes no update/delete functions for this table.
+CREATE TABLE IF NOT EXISTS executions (
+  id                  INTEGER      PRIMARY KEY,
+  position_id         INTEGER      REFERENCES positions(id) ON DELETE CASCADE,
+  campaign_id         TEXT,
+  symbol              TEXT         NOT NULL,
+  action              TEXT         NOT NULL,
+  date                TEXT,
+  quantity            NUMERIC,
+  execution_price     NUMERIC,
+  net_credit_debit    NUMERIC,
+  commission          NUMERIC      DEFAULT 0,
+  exchange_fees       NUMERIC      DEFAULT 0,
+  gst                 NUMERIC      DEFAULT 0,
+  notes               TEXT,
+  linked_position_id  INTEGER      REFERENCES positions(id) ON DELETE SET NULL,
+  created_at          TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_executions_position ON executions(position_id);
+CREATE INDEX IF NOT EXISTS idx_executions_campaign ON executions(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_executions_action   ON executions(action);
+CREATE INDEX IF NOT EXISTS idx_executions_date     ON executions(date);
+
+-- ── Migration: add updated_at to tables that predate this column ─────────
+-- CREATE TABLE IF NOT EXISTS above won't retroactively add a column to an
+-- already-existing table in a live Supabase project, so these ALTER lines
+-- are required even though the CREATE TABLE blocks now include the column
+-- for fresh installs.
+ALTER TABLE calendar_events  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE recommendations  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
 -- ── Auto-update updated_at trigger ──────────────────────────
+-- Applied to all 6 tables so cloud-vs-local conflict detection (offline-first
+-- refactor) has a reliable updated_at to compare on every table, not just 4.
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -145,7 +185,7 @@ DO $$
 DECLARE
   t TEXT;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['positions','campaigns','journal_entries','watchlist']
+  FOREACH t IN ARRAY ARRAY['positions','campaigns','journal_entries','watchlist','calendar_events','recommendations']
   LOOP
     EXECUTE format(
       'DROP TRIGGER IF EXISTS trg_%I_updated_at ON %I;

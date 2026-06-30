@@ -9,11 +9,13 @@
     "dexie": "^3.2.4",
     "express": "^5.2.1",
     "papaparse": "^5.4.1",
+    "pdfjs-dist": "^6.1.200",
     "react": "^18.2.0",
     "react-big-calendar": "^1.8.5",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
     "recharts": "^2.10.0",
+    "tesseract.js": "^7.0.0",
     "tigeropen": "^0.4.0",
     "xlsx": "^0.18.5",
     "zustand": "^4.4.0"
