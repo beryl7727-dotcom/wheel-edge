@@ -1,0 +1,146 @@
+{
+  "name": "wheel-edge-trading-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
+    "cors": "^2.8.6",
+    "date-fns": "^2.30.0",
+    "dexie": "^3.2.4",
+    "express": "^5.2.1",
+    "papaparse": "^5.4.1",
+    "react": "^18.2.0",
+    "react-big-calendar": "^1.8.5",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.20.0",
+    "recharts": "^2.10.0",
+    "tigeropen": "^0.4.0",
+    "xlsx": "^0.18.5",
+    "zustand": "^4.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/forms": "^0.5.4",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^10.0.3",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "electron-is-dev": "^3.0.1",
+    "jimp": "^1.6.1",
+    "png-to-ico": "^3.0.1",
+    "postcss": "^8.4.31",
+    "react-scripts": "5.0.1",
+    "tailwindcss": "^3.3.0",
+    "wait-on": "^9.0.10"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "server": "node server.js",
+    "dev": "concurrently \"npm start\" \"npm run server\"",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "electron:dev": "concurrently \"npm start\" \"npm run server\" \"wait-on http://localhost:3000 && electron .\"",
+    "electron:build": "npm run build && electron-builder --win",
+    "electron:build:all": "npm run build && electron-builder -mwl"
+  },
+  "homepage": "./",
+  "main": "public/main.js",
+  "homepage-electron": "./",
+  "eslintConfig": {
+    "extends": [
+      "react-app"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "build": {
+    "appId": "com.wheeledge.trading",
+    "productName": "Wheel Edge",
+    "copyright": "Wheel Edge Trading",
+    "asar": false,
+    "files": [
+      "build/**/*",
+      "public/main.js",
+      "public/preload.js",
+      "public/icon.png",
+      "node_modules/**/*",
+      "!node_modules/.cache/**/*",
+      "!node_modules/@babel/**/*",
+      "!node_modules/webpack/**/*",
+      "!node_modules/webpack-*/**/*",
+      "!node_modules/react-scripts/**/*",
+      "!node_modules/eslint*/**/*",
+      "!node_modules/jest*/**/*",
+      "!node_modules/babel-*/**/*",
+      "!node_modules/postcss/**/*",
+      "!node_modules/tailwindcss/**/*",
+      "!node_modules/autoprefixer/**/*",
+      "!node_modules/electron-builder/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "tiger_openapi_config.properties",
+        "to": "tiger_openapi_config.properties"
+      },
+      {
+        "from": ".env",
+        "to": ".env"
+      }
+    ],
+    "directories": {
+      "buildResources": "public",
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "public/icon.ico",
+      "publisherName": "Wheel Edge"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Wheel Edge",
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "public/icon.icns",
+      "category": "public.app-category.finance"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "public/icon.png",
+      "category": "Finance"
+    }
+  }
+}

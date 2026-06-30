@@ -1,0 +1,8 @@
+# Tiger OpenAPI Configuration — copy to tiger_openapi_config.properties and fill in your real values.
+# This file is never committed (see .gitignore). Without it, the app falls back to mock market data.
+private_key_pk1=your-rsa-private-key-pkcs1-format
+private_key_pk8=your-rsa-private-key-pkcs8-format
+tiger_id=your-tiger-id
+account=your-account-number
+license=your-license-code
+env=PROD
