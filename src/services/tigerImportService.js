@@ -28,18 +28,23 @@ export async function fetchTigerPositions() {
     const res = await fetch(`${BASE}/positions`, { signal: AbortSignal.timeout(10000) });
     const data = await res.json();
 
-    if (data.useMock || !res.ok) {
+    if (!res.ok || data.error) {
       return {
-        positions: MOCK_TIGER_POSITIONS,
-        source:    'mock',
-        error:     data.error || null,
-        useMock:   true,
+        positions: [],
+        source:    'error',
+        error:     data.error || `HTTP ${res.status}`,
+        useMock:   false,
       };
     }
     return { positions: data.positions || [], source: 'live', error: null, useMock: false };
-  } catch (err) {
-    // Server offline — use mock
-    return { positions: MOCK_TIGER_POSITIONS, source: 'mock', error: 'Backend server offline', useMock: true };
+  } catch {
+    // Server not running — give the user a clear instruction rather than fake data.
+    return {
+      positions: [],
+      source:    'offline',
+      error:     'Backend server is not running.',
+      useMock:   false,
+    };
   }
 }
 

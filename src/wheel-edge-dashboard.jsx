@@ -1668,6 +1668,9 @@ function Dashboard() {
     .filter(p => isOptPos(p) && (p.premium || 0) > 0)
     .reduce((s, p) => s + p.premium, 0);
 
+  // BUYING POWER — net exposure (premium tied up in open positions) plus realized profit.
+  const buyingPower = openPremiumExposure + totalRealizedProfit;
+
   // 4. COMMISSIONS — tracked separately, never mixed into premium or realized P&L
   const thisYear = new Date().getFullYear().toString();
   const commissionsYTD = positions
@@ -1786,7 +1789,7 @@ function Dashboard() {
           <StatCard compact title="Commissions YTD"     value={commissionsYTD > 0 ? `-$${commissionsYTD.toFixed(2)}` : '$0.00'}                             subtitle="Drag on performance"  color="from-amber-500 to-orange-500" />
           <StatCard compact title="Active Campaigns"    value={activeCampaigns.length}                                                                      subtitle="Open campaigns"       color="from-orange-500 to-red-500" />
           <StatCard compact title="Avg DTE"             value={avgDTE}                                                                                      subtitle="Days to expiry"       color="from-purple-500 to-pink-500" />
-          <StatCard compact title="Premium Collected"   value={`$${allPremiumCollected.toLocaleString()}`}                                                  subtitle="All credits received"  color="from-green-500 to-emerald-600" />
+          <StatCard compact title="Buying Power"        value={`${buyingPower >= 0 ? '+' : '-'}$${Math.abs(buyingPower).toLocaleString()}`}                  subtitle="Open exposure + realized"  color={buyingPower >= 0 ? 'from-green-500 to-emerald-600' : 'from-red-500 to-orange-500'} />
           <StatCard compact title="Realized Profit"     value={`${totalRealizedProfit >= 0 ? '+' : ''}$${Math.abs(totalRealizedProfit).toLocaleString()}`}  subtitle="Closed only"          color={totalRealizedProfit >= 0 ? 'from-teal-500 to-green-600' : 'from-red-500 to-orange-500'} />
           <StatCard compact title="Open Exposure"       value={`$${openPremiumExposure.toLocaleString()}`}                                                  subtitle="In open positions"    color="from-blue-500 to-cyan-500" />
         </div>
@@ -2748,18 +2751,23 @@ function ImportFromTigerModal({ onClose }) {
 
   const [phase,    setPhase]    = useState('loading');  // loading | review | success | error
   const [rows,     setRows]     = useState([]);
-  const [fetchSrc, setFetchSrc] = useState('live');     // live | mock
+  const [fetchSrc, setFetchSrc] = useState('live');     // live | offline | error
   const [apiError, setApiError] = useState('');
   const [result,   setResult]   = useState(null);
 
   // Fetch on mount
   useEffect(() => {
     let cancelled = false;
-    fetchTigerPositions().then(({ positions, source, error, useMock }) => {
+    fetchTigerPositions().then(({ positions, source, error }) => {
       if (cancelled) return;
-      if (useMock && error) setApiError(error);
       setFetchSrc(source);
-      const normalised = positions.map(p => normaliseForReview(p, existingPositions, campaigns));
+      if (source === 'offline') {
+        setApiError('Backend server is not running. In a separate terminal, run: npm run server  (or npm run dev to start everything at once)');
+        setPhase('error');
+        return;
+      }
+      if (error) setApiError(error);
+      const normalised = (positions || []).map(p => normaliseForReview(p, existingPositions, campaigns));
       setRows(normalised);
       setPhase('review');
     }).catch(() => {
@@ -2821,20 +2829,24 @@ function ImportFromTigerModal({ onClose }) {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <span className={`text-xs px-2 py-1 rounded-full font-semibold ${
-              fetchSrc === 'live' ? 'bg-green-100 text-green-700' : 'bg-orange-100 text-orange-700'
-            }`}>
-              {fetchSrc === 'live' ? '🟢 Live Data' : '📊 Mock Data (API unavailable)'}
-            </span>
+            {fetchSrc === 'live' && (
+              <span className="text-xs px-2 py-1 rounded-full font-semibold bg-green-100 text-green-700">🟢 Live Data</span>
+            )}
+            {fetchSrc === 'error' && (
+              <span className="text-xs px-2 py-1 rounded-full font-semibold bg-amber-100 text-amber-700">⚠️ API Error</span>
+            )}
+            {fetchSrc === 'offline' && (
+              <span className="text-xs px-2 py-1 rounded-full font-semibold bg-red-100 text-red-700">🔴 Server Offline</span>
+            )}
             <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-2xl leading-none">&times;</button>
           </div>
         </div>
 
-        {/* API error notice */}
-        {apiError && (
-          <div className="px-6 py-2 bg-orange-50 border-b border-orange-100 shrink-0">
-            <p className="text-xs text-orange-700">
-              <strong>API note:</strong> {apiError.slice(0, 120)}{apiError.length > 120 ? '…' : ''} — showing mock data so you can test the import flow.
+        {/* API error notice (Tiger API errors only — offline is handled in body) */}
+        {apiError && fetchSrc === 'error' && (
+          <div className="px-6 py-2 bg-amber-50 border-b border-amber-100 shrink-0">
+            <p className="text-xs text-amber-800">
+              <strong>Tiger API error:</strong> {apiError}
             </p>
           </div>
         )}
@@ -2849,15 +2861,26 @@ function ImportFromTigerModal({ onClose }) {
           )}
 
           {phase === 'error' && (
-            <div className="text-center py-12">
-              <p className="text-slate-500">Failed to connect to the Tiger API server.</p>
-              <p className="text-xs text-slate-400 mt-1">Ensure <code>npm run server</code> is running on port 3001.</p>
+            <div className="flex flex-col items-center justify-center py-12 gap-3 text-center">
+              <span className="text-4xl">🔴</span>
+              <p className="text-base font-semibold text-slate-800">Tiger backend server is not running</p>
+              <p className="text-sm text-slate-500 max-w-md">
+                The import feature requires the backend server to connect to the Tiger API.
+                Open a separate terminal in the project folder and run:
+              </p>
+              <code className="text-sm bg-slate-100 border border-slate-300 rounded-lg px-4 py-2 font-mono text-slate-900 select-all">
+                npm run dev
+              </code>
+              <p className="text-xs text-slate-400 mt-1">
+                This starts both the React app and the Tiger API server together on port 3001.
+                Then reopen this dialog.
+              </p>
             </div>
           )}
 
           {phase === 'review' && rows.length === 0 && (
             <div className="text-center py-12">
-              <p className="text-slate-500">No positions found in your Tiger account.</p>
+              <p className="text-slate-500">No open positions found in your Tiger account.</p>
             </div>
           )}
 
