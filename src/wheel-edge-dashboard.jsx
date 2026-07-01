@@ -11,6 +11,7 @@ import { getLastCloudBackupAt } from './services/cloudBackup.js';
 import { SyncStatusIndicator, SaveToCloudButton, RestoreFromCloudButton, SnapshotHistoryList } from './components/BackupUI.jsx';
 import { RollPositionModal, PositionLineageTimeline } from './components/ExecutionLedgerUI.jsx';
 import PoemsImportWizard from './components/PoemsImportWizard.jsx';
+import RallyMeterPage from './components/RallyMeterPage.jsx';
 import * as XLSX from 'xlsx';
 
 const LOCALSTORAGE_MIGRATION_FLAG = 'migratedFromLocalStorage';
@@ -681,7 +682,8 @@ function Sidebar() {
     { name: 'Calendar',           path: '/calendar',     icon: '📅' },
     { name: 'Rotation Watchlist', path: '/watchlist',    icon: '👁️' },
     { name: 'Income Tracker',     path: '/income',       icon: '💰' },
-    { name: 'Journal',            path: '/journal',      icon: '📝' },
+    { name: 'Journal',             path: '/journal',      icon: '📝' },
+    { name: 'Rally Meter',        path: '/rally',        icon: '🌤' },
     { name: 'Backup',             path: '/backup',       icon: '☁️' },
     { name: 'Settings',           path: '/settings',     icon: '⚙️' },
   ];
@@ -8808,6 +8810,7 @@ function App() {
         <Route path="/watchlist" element={<RotationWatchlist />} />
         <Route path="/income" element={<IncomeTracker />} />
         <Route path="/journal" element={<Journal />} />
+        <Route path="/rally"  element={<RallyMeterPage />} />
         <Route path="/backup" element={<Backup />} />
         <Route path="/settings" element={<Settings />} />
       </Routes>

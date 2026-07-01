@@ -97,3 +97,17 @@ db.version(3).stores({
   meta:           'key',
   executions:     'id, positionId, campaignId, action, date, importFingerprint, _updatedAt',
 });
+
+// Version 4 — adds rally probability meter report storage.
+db.version(4).stores({
+  positions:      'id, campaignId, status, _updatedAt',
+  campaigns:      'id, symbol, status, _updatedAt',
+  journal:        'id, positionId, symbol, _updatedAt',
+  calendar:       'id, date, category, _updatedAt',
+  watchlist:      'id, symbol, _updatedAt',
+  priceSnapshots: 'id, positionId, symbol, _updatedAt',
+  snapshots:      '++id, timestamp',
+  meta:           'key',
+  executions:     'id, positionId, campaignId, action, date, importFingerprint, _updatedAt',
+  rallyReports:   '++id, market, date, score, condition, createdAt',
+});
